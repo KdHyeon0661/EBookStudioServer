@@ -50,6 +50,7 @@ defaults/keywords_history.json.tmp
 *_bg_jobs.json
 *jobs*.json
 *result_cache*.json
+defaults/music_index.json
 
 # =========================
 # Music assets (DO NOT COMMIT)
