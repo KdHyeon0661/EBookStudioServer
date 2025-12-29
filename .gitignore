@@ -1,0 +1,58 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs / cache
+*.log
+.cache/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# =========================
+# Runtime / local data (DO NOT COMMIT)
+# =========================
+# User uploads + generated outputs (PDF/PNG/JSON) + job queue
+users/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Any runtime/generated JSONs that may live outside users/
+defaults/keywords_history.json
+defaults/keywords_history.json.tmp
+*_bg_jobs.json
+*jobs*.json
+*result_cache*.json
+
+# =========================
+# Music assets (DO NOT COMMIT)
+# =========================
+# Ignore the entire music folder (preset + generated)
+defaults/music/
