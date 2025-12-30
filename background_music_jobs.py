@@ -42,7 +42,7 @@ except LookupError:
 _KEYWORDS_HISTORY_LOCK = threading.Lock()
 _BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 _DEFAULTS_DIR = os.path.join(_BASE_DIR, "defaults")
-_MUSIC_DEFAULTS_DIR = os.path.join(_DEFAULTS_DIR, "music")  # 여기가 메인 저장소
+_MUSIC_DEFAULTS_DIR = os.path.join(_DEFAULTS_DIR, "music")
 
 _KEYWORDS_HISTORY_PATH = os.environ.get("KEYWORDS_HISTORY_PATH") or os.path.join(_DEFAULTS_DIR, "keywords_history.json")
 
@@ -98,18 +98,11 @@ def _prompt_signature(prompt, genre, bpm, keywords, target_duration_sec, segment
 # =========================================================
 
 def find_master_file(filename):
-    """
-    defaults/music 및 하위 폴더(storage_xxx)에서 파일 검색
-    """
     if not os.path.exists(_MUSIC_DEFAULTS_DIR):
         return None
-
-    # 1. 루트 확인
     root_path = os.path.join(_MUSIC_DEFAULTS_DIR, filename)
     if os.path.exists(root_path):
         return root_path
-
-    # 2. 하위 폴더 확인
     for entry in os.scandir(_MUSIC_DEFAULTS_DIR):
         if entry.is_dir():
             target = os.path.join(entry.path, filename)
@@ -119,33 +112,22 @@ def find_master_file(filename):
 
 
 def get_storage_folder():
-    """
-    저장할 폴더(storage_xxx) 결정. 꽉 차면 새 폴더 생성.
-    """
     if not os.path.exists(_MUSIC_DEFAULTS_DIR):
         os.makedirs(_MUSIC_DEFAULTS_DIR, exist_ok=True)
-
     subdirs = []
     for entry in os.scandir(_MUSIC_DEFAULTS_DIR):
         if entry.is_dir() and entry.name.startswith("storage_"):
             subdirs.append(entry.name)
-
     subdirs.sort()
 
     target_dir = None
-
     if subdirs:
         last_dir_name = subdirs[-1]
         last_dir_path = os.path.join(_MUSIC_DEFAULTS_DIR, last_dir_name)
-
-        # 파일 수 확인
-        # (주의: 너무 많은 파일이 있으면 len()이 느릴 수 있으나, 1000개 정도는 순식간임)
         file_count = len([f for f in os.listdir(last_dir_path) if os.path.isfile(os.path.join(last_dir_path, f))])
-
         if file_count < MAX_FILES_PER_FOLDER:
             target_dir = last_dir_path
         else:
-            # 새 폴더 생성
             try:
                 last_num = int(last_dir_name.split('_')[1])
                 new_name = f"storage_{last_num + 1:03d}"
@@ -157,7 +139,6 @@ def get_storage_folder():
 
     if not os.path.exists(target_dir):
         os.makedirs(target_dir, exist_ok=True)
-
     return target_dir
 
 
@@ -371,10 +352,11 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
     max_tokens = int(chunk_sec * 50)
 
     final_audio = None
-    print(f"      [MusicGen] Generating {target_duration_sec}s for '{prompt}'...")
+    print(f"      [MusicGen] Generating {target_duration_sec}s for '{prompt[:30]}...' (Total Chunks: {num_chunks})")
 
     for i in range(num_chunks):
         try:
+            start_time = time.time()
             inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(device)
             with torch.no_grad():
                 audio_values = music_model.generate(
@@ -393,6 +375,9 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
 
             del inputs, audio_values
             if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+            elapsed = time.time() - start_time
+            print(f"         ⏳ Chunk {i + 1}/{num_chunks} 생성 완료 ({elapsed:.1f}초 소요)")
             time.sleep(0.5)
         except Exception as e:
             print(f"         ❌ Chunk {i + 1} fail: {e}")
@@ -407,10 +392,6 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
 
 
 def process_book_background(json_path, music_folder, web_path_prefix, username=None, book_id=None):
-    """
-    [수정] music_folder 인자는 더 이상 로컬 저장용으로 쓰지 않음 (구조상 전달은 되지만 무시)
-    음악은 오직 defaults/music/storage_xxx 에만 저장됨.
-    """
     load_models()
 
     if os.path.isdir(json_path):
@@ -436,19 +417,15 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
 
         if not chapters: continue
 
-        # [삭제] 사용자 책 폴더 내 music 폴더 생성 코드 삭제됨
-        # if not os.path.exists(music_folder): os.makedirs(...) -> 삭제
-
         for ci, chapter in enumerate(chapters):
             segments = chapter.get("segments", []) or []
 
             for si, segment in enumerate(segments):
                 try:
                     current_name = str(segment.get("music_filename", "") or "")
-                    if current_name and current_name.endswith(".wav"):
-                        continue
 
-                    # 텍스트 추출 및 분석
+                    # [중요] 기존 파일이 있어도 무시하고 생성하도록 해당 체크 로직 제거됨.
+
                     pages = segment.get("pages", []) or []
                     texts = [p.get("text", "").strip() for p in pages if isinstance(p, dict)]
                     combined_text = " ".join(texts).strip()
@@ -465,15 +442,9 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                     seg_dur = 30
                     norm_keywords = _normalize_keywords(analysis.get("keywords", []))
 
-                    # 해시 생성
                     sig = _prompt_signature(prompt, genre, int(bpm), norm_keywords, target_duration, seg_dur)
                     filename = f"{sig}.wav"
 
-                    # -----------------------------------------------------
-                    # [핵심] 오직 공용 스토리지(defaults/music/storage_xxx)만 사용
-                    # -----------------------------------------------------
-
-                    # 1. 이미 존재하는지 찾기
                     master_path = find_master_file(filename)
                     music_source = "ai_gen"
 
@@ -481,21 +452,17 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                         print(f"♻️ [Reuse] Found in storage: {master_path}")
                         music_source = "ai_reused"
                     else:
-                        # 2. 새로 생성
                         print(f"🎹 [New] Generating: {filename}")
                         audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
 
                         if audio is not None and sr is not None:
-                            # 저장할 폴더 결정 (storage_001, 002...)
                             save_dir = get_storage_folder()
                             master_path = os.path.join(save_dir, filename)
 
-                            # 저장
                             audio = np.clip(audio, -1.0, 1.0)
                             audio_i16 = (audio * 32767).astype(np.int16)
                             wavfile.write(master_path, sr, audio_i16)
 
-                            # 메타데이터도 같이 저장
                             meta_path = master_path.replace(".wav", ".json")
                             with open(meta_path, "w", encoding="utf-8") as mf:
                                 json.dump({
@@ -508,11 +475,8 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                             print("❌ Audio generation failed.")
                             continue
 
-                    # [중요] 사용자 폴더로 복사하지 않음! (삭제됨)
-
-                    # JSON 업데이트
                     segment["music_filename"] = filename
-                    segment["music_path"] = f"music/{filename}"  # 클라이언트가 music 폴더에서 찾도록 유도
+                    segment["music_path"] = f"music/{filename}"
                     segment["music_source"] = music_source
                     segment["emotion"] = analysis.get("emotion", "neutral")
                     segment["genre"] = genre
@@ -544,6 +508,9 @@ class BackgroundMusicJobRunner:
         self._jobs = []
         self._load()
 
+        # [추가됨] 서버 켜질 때 'running' 상태인 작업 복구 (Zombie Jobs Recovery)
+        self._recover_stuck_jobs()
+
     def _load(self):
         try:
             if os.path.exists(self.queue_file):
@@ -562,6 +529,23 @@ class BackgroundMusicJobRunner:
         except:
             pass
 
+    # [추가됨] 중단된 작업 복구 메서드
+    def _recover_stuck_jobs(self):
+        with self._lock:
+            self._load()
+            recovered_count = 0
+            for job in self._jobs:
+                # 상태가 'running'인 채로 멈춰있는 녀석들을 찾음
+                if job.get("status") == "running":
+                    print(f"♻️ [Recovery] 중단된 작업 복구: {job.get('book_id')} (ID: {job.get('id')})")
+                    job["status"] = "queued"  # 다시 대기열로
+                    job["started_at"] = 0
+                    recovered_count += 1
+
+            if recovered_count > 0:
+                self._save()
+                print(f"✅ 총 {recovered_count}개의 중단된 작업을 대기열로 복구했습니다.")
+
     def enqueue(self, job_type, username, book_id, json_path=None, music_folder=None,
                 web_path_prefix=None, pdf_path=None, book_root_folder=None):
         with self._lock:
@@ -575,7 +559,7 @@ class BackgroundMusicJobRunner:
                 "status": "queued",
                 "created_at": int(time.time()),
                 "json_path": json_path,
-                "music_folder": music_folder,  # 이제 사용 안 함
+                "music_folder": music_folder,
                 "web_path_prefix": web_path_prefix,
                 "pdf_path": pdf_path,
                 "book_root_folder": book_root_folder
@@ -602,8 +586,8 @@ class BackgroundMusicJobRunner:
             status = "error"
             err = None
             try:
-                if job["type"] == "analyze":
-                    print(f"📘 [Job] Analyzing Book: {job['book_id']}")
+                if job["type"] == "analyze" or job["type"] == "analyze_and_music":
+                    print(f"📘 [Job] Analyzing Book: {job.get('book_id', 'Unknown')}", flush=True)
                     try:
                         from analyzer import process_full_book_for_offline
                     except ImportError:
@@ -616,9 +600,13 @@ class BackgroundMusicJobRunner:
                         web_path_prefix=job["web_path_prefix"]
                     )
 
+                    # [디버깅] 분석기 결과 출력
+                    print(f"   🔍 [Debug] 분석기 반환값: {result}", flush=True)
+
                     if result and 'text_file' in result:
                         full_json_path = os.path.join(job["book_root_folder"], result['text_file'])
 
+                        print(f"   ↪️ 분석 완료. 음악 생성 작업(Music)을 큐에 추가합니다.", flush=True)
                         self.enqueue(
                             job_type='music',
                             username=job["username"],
@@ -630,7 +618,7 @@ class BackgroundMusicJobRunner:
                     status = "done"
 
                 elif job["type"] == "music":
-                    print(f"🎹 [Job] Generating Music: {job['book_id']}")
+                    print(f"🎹 [Job] Generating Music: {job.get('book_id', 'Unknown')}", flush=True)
 
                     process_book_background(
                         job["json_path"],
@@ -640,19 +628,21 @@ class BackgroundMusicJobRunner:
                         job.get("book_id")
                     )
 
-                    # [Indexer 업데이트]
-                    # storage_xxx 폴더를 스캔해서 index.json에 등록
                     if create_music_index:
                         try:
                             create_music_index()
                         except:
                             pass
 
+                    print(f"🎹 [Job] Generating Music Finished!", flush=True)
                     status = "done"
+                else:
+                    print(f"⚠️ [Job] 알 수 없는 작업 타입: {job['type']}", flush=True)
+                    status = "skipped"
 
             except Exception as e:
                 err = str(e)
-                print(f"❌ Job Failed: {e}")
+                print(f"❌ Job Failed: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
 
@@ -664,6 +654,9 @@ class BackgroundMusicJobRunner:
                         j["finished_at"] = int(time.time())
                         j["error"] = err
                         break
+
+                # [청소] 완료된 작업(done, skipped)은 리스트에서 삭제
+                self._jobs = [j for j in self._jobs if j["status"] not in ["done", "skipped"]]
                 self._save()
 
         return {"ran": ran}
