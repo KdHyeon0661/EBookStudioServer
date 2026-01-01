@@ -344,11 +344,6 @@ def upload_book():
         client_username = _resolve_client_username(current_user_uuid)
         web_path_prefix = f"/files/{client_username}/{book_folder_name}"
 
-        # ---------------------------------------------------------
-        # [삭제됨] 여기서 create_music_index() 호출하던 것 제거!
-        # 책(PDF)만 올렸는데 음악 인덱싱을 돌리는 건 자원 낭비이자 논리 오류임.
-        # ---------------------------------------------------------
-
         # 작업 등록 (여기서 분석 -> 음악생성 -> 인덱싱 순으로 처리됨)
         job_id = bg_runner.enqueue(
             job_type='analyze',
@@ -530,7 +525,6 @@ def _start_periodic_execute():
     max_jobs = int(os.environ.get("MAX_JOBS_PER_RUN", "5"))
 
     def _loop():
-        # [로그 추가] 시작됨을 알림
         print(f"🚀 [JobRunner] 백그라운드 워커 가동됨 (Interval: {interval}s)")
         while True:
             try:

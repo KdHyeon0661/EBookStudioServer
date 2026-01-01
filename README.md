@@ -1,146 +1,172 @@
-# EbookStudioServer (Flask)
+# EbookStudio Server (Flask)
 
-WPF 클라이언트(EBookStudio)에서 PDF를 업로드하면, 서버가 PDF를 분석해 **표지(PNG)** 와 **전체 텍스트 JSON(_full.json)** 을 생성하고, JSON의 각 세그먼트에 **프리셋 음악(또는 AI 생성 음악)** 을 매핑하는 Flask 서버입니다.
+**EBookStudio** 클라이언트(WPF)를 위한 백엔드 서버입니다.
+사용자가 PDF를 업로드하면 서버는 이를 분석하여 **표지(PNG)** 및 **구조화된 텍스트(JSON)** 를 생성하고, 각 문단(Segment)의 감정을 분석하여 **배경 음악(AI 생성 또는 프리셋)** 을 자동으로 매핑합니다.
 
-> 현재 구조는 **Flat 저장 방식**입니다. (books/texts/covers 폴더로 나누지 않고 `users/<uuid>/<book>/` 루트에 PNG/JSON/PDF를 저장)
+> **저장 구조:** `users/<uuid>/<book>/` 경로에 PDF, PNG, JSON 파일을 모두 저장하는 **Flat 구조**를 따릅니다.
 
 ---
 
-## 핵심 동작 요약
+## 핵심 기능 및 동작 원리
 
-1. 클라이언트가 `/upload_book` 로 PDF 업로드
-2. 백그라운드 큐에 `analyze` 작업 등록
-3. `analyzer.py`가 결과 생성
-   - `users/<uuid>/<book>/<book>.png`
-   - `users/<uuid>/<book>/<book>_full.json`
-4. JSON 내부 `music_path`는 `"music/<filename>"` 형태로 기록  
-   - 책 폴더 안에 `music/` 폴더를 만들지 않습니다.
-   - 음악 실파일은 `defaults/music/` 또는 `defaults/music/storage_xxx/`에 존재합니다.
-5. 클라이언트는 `/list_music_files/<username>/<book>`로 필요한 음악 파일명을 얻고,
-   `/files/<username>/<book>/music/<filename>`로 다운로드합니다.
+1. **PDF 업로드 및 분석 요청**:
+* 클라이언트가 `/upload_book`으로 PDF를 전송하면 서버는 파일을 저장하고 백그라운드 작업 큐(`analyze`)에 등록합니다.
+
+
+2. **비동기 분석 (Analyzer)**:
+* `analyzer.py`가 PDF를 파싱하여 표지 이미지와 텍스트 데이터를 추출합니다.
+* 텍스트의 감정/분위기를 분석하여 적절한 음악을 매칭하거나 생성합니다.
+
+
+3. **결과물 생성**:
+* `users/<uuid>/<book>/<book>.png` (표지)
+* `users/<uuid>/<book>/<book>_full.json` (메타데이터 및 본문)
+
+
+4. **음악 매핑 및 제공**:
+* JSON 내 `music_path`는 `"music/<filename>"` 형식으로 저장됩니다.
+* 실제 음악 파일은 각 사용자 폴더가 아닌 **공용 스토리지(`defaults/music/`)** 에 저장되어 관리됩니다.
+* 클라이언트는 `/files/.../music/<filename>` 엔드포인트를 통해 중앙 저장소의 음악을 다운로드합니다.
+
+
 
 ---
 
 ## 폴더 구조
 
-프로젝트 루트 기준:
-
-```
+```bash
 EbookStudioServer/
-  server.py
-  analyzer.py
-  background_music_jobs.py
-  indexer.py
+├── server.py                 # 메인 Flask 앱 및 라우트 핸들러
+├── analyzer.py               # PDF 분석 및 텍스트 마이닝 로직
+├── background_music_jobs.py  # AI 음악 생성 및 백그라운드 작업 관리
+├── indexer.py                # 음악 파일 인덱싱 및 DB화
+├── pytest.ini                # 테스트 설정 파일
+├── requirements.txt          # (권장) 의존성 패키지 목록
+│
+├── defaults/                 # 서버 기본 리소스
+│   ├── default.png
+│   ├── music_index.json      # 음악 파일 인덱스 데이터
+│   └── music/                # [중요] 음악 파일 저장소 (AI 생성/프리셋)
+│       └── storage_xxx/      # 파일 개수 제한에 따른 하위 폴더
+│
+├── users/                    # [런타임 생성] 사용자 데이터 저장소
+│   ├── _bg_jobs.json         # 백그라운드 작업 큐 상태
+│   └── <uuid>/               # 사용자별 격리 공간
+│       └── <BookTitle>/      # 책 단위 폴더
+│
+├── tests/                    # 단위 및 통합 테스트
+│   ├── conftest.py
+│   ├── test_auth.py
+│   ├── test_logic.py
+│   └── ...
+│
+└── users.db                  # [런타임 생성] 사용자/인증 정보 SQLite DB
 
-  defaults/
-    default.png
-    emotions_20.py
-    music_genres_200.py
-    genre_bpm_connector.py
-    music_index.json
-    music/                 # 프리셋/AI 생성 음악 저장소(공용)
-      storage_001/         # (자동 생성될 수 있음)
-
-  users/                   # 런타임 생성 (업로드/결과 저장소)
-    <uuid>/<BookTitle>/
-      <BookTitle>.pdf
-      <BookTitle>.png
-      <BookTitle>_full.json
-    _bg_jobs.json          # 런타임 큐 파일
-
-  users.db                 # SQLite DB(런타임)
 ```
 
 ---
 
-## 요구 사항
+## 설치 및 실행 방법
 
-- Python 3.10+ 권장
-- 주요 라이브러리
-  - flask, flask_sqlalchemy, flask_jwt_extended, werkzeug
-  - PyMuPDF (`fitz`)
-  - nltk (wordnet 자동 다운로드 시도)
-  - **AI 음악 생성 파이프라인 의존성(현재 import가 강제됨)**  
-    torch, transformers, keybert, scipy, numpy
+### 1. 필수 요건 (Prerequisites)
 
-> ⚠️ `background_music_jobs.py`는 import 시점에 torch/transformers 등을 바로 import 합니다.  
-> “프리셋 음악만” 쓰고 싶다면 해당 파일을 옵션화/지연 import로 리팩터링해야 합니다.
+* **Python 3.10 이상**
+* **FFmpeg** (오디오 처리를 위해 설치 권장, Windows/Linux 환경에 따라 필요할 수 있음)
 
----
-
-## 실행 방법(개발)
-
-### 1) 가상환경 & 설치
+### 2. 가상환경 설정 및 패키지 설치
 
 ```bash
-cd EbookStudioServer
+# 가상환경 생성
 python -m venv .venv
 
-# Windows
-# .venv\Scripts\activate
-# macOS/Linux
-# source .venv/bin/activate
+# 가상환경 활성화
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
 
+# 필수 패키지 설치
 pip install -U pip
-pip install flask flask_sqlalchemy flask_jwt_extended werkzeug
-pip install PyMuPDF nltk
-pip install torch transformers keybert scipy numpy
+pip install -r requirements.txt
+
 ```
 
-### 2) 서버 실행
+> **참고:** `requirements.txt`가 없다면 다음 명령어로 주요 라이브러리를 직접 설치하세요.
+> ```bash
+> pip install flask flask_sqlalchemy flask_jwt_extended werkzeug
+> pip install PyMuPDF nltk librosa
+> pip install torch transformers keybert scipy numpy pytest pytest-flask pytest-mock requests-mock
+> 
+> ```
+> 
+> 
+
+### 3. 서버 실행
 
 ```bash
 python server.py
+
 ```
 
-- 기본 주소: `http://0.0.0.0:5000`
-- 헬스체크: `GET /health`
+* 서버는 기본적으로 `http://0.0.0.0:5000`에서 실행됩니다.
+* 최초 실행 시 NLTK 데이터 다운로드 및 음악 인덱싱이 수행될 수 있습니다.
 
 ---
 
-## 환경변수
+## 테스트 실행
 
-- `SECRET_KEY` : JWT 서명 키  
-  (미설정 시 매 실행마다 랜덤 생성 → 서버 재시작하면 기존 토큰이 사실상 무효가 될 수 있음)
-- `FLASK_DEBUG` : `1`이면 debug 모드 (기본 `1`)
-- `ENABLE_PERIODIC_EXECUTE` : `1`이면 백그라운드 큐 실행 (기본 `1`)
-- `EXECUTE_INTERVAL_SECONDS` : 설정은 존재하나 현재 루프는 2초 sleep을 사용
-- `MAX_JOBS_PER_RUN` : 한 번에 처리할 큐 작업 수 (기본 `5`)
-- `KEYWORDS_HISTORY_PATH` : 키워드 히스토리 저장 경로 (기본 `defaults/keywords_history.json`)
+프로젝트의 안정성을 검증하기 위해 `pytest`를 사용합니다.
 
----
+```bash
+# 전체 테스트 실행
+pytest
 
-## API 요약
+# 상세 결과 확인
+pytest -v
 
-### Auth / 계정
-- `POST /register` `{ username, email, password }`
-- `POST /login` `{ username, password }` → access/refresh 반환
-- `POST /refresh` (refresh 토큰 필요)
-- `POST /logout` (토큰 blocklist 등록)
-
-### 이메일 인증(현재 콘솔 출력)
-- `POST /send_code` `{ email }`
-- `POST /verify_code` `{ email, code }`
-
-### 책/라이브러리
-- `POST /upload_book` (multipart: `file=PDF`) → 202 + `job_id`, `book_title`
-- `POST /sync_library` `{ username, book_title }` → book_data(JSON) 반환
-- `POST /get_toc` `{ username, filename }` → 목차 리스트 반환
-- `GET  /list_music_files/<username>/<book_title>` → JSON에서 사용된 음악 파일명 목록
-- `POST /my_books` → 서버에 저장된 내 책 목록
-- `POST /delete_server_book` `{ book_title }` → 서버 책 폴더 삭제(음악은 보존)
-
-### 파일 서빙
-- `GET /files/<username>/<book_folder>/<filename>`  
-  → `users/<uuid>/<book_folder>/<filename>` 에서 제공 (**사실상 인증 필요**)
-- `GET /files/<username>/<book_folder>/music/<filename>`  
-  → `defaults/music/` 또는 `defaults/music/storage_xxx/`에서 찾아 제공
-
-> `<username>` 자리에는 실제로 `username` 또는 `uuid`를 넣어도 동작할 수 있으며, 최종 권한은 JWT identity(uuid)로 검증합니다.
+```
 
 ---
 
-## 개발 메모
+## 환경 변수 설정
 
-- `users/`, `users.db`, `__pycache__/`, `defaults/keywords_history.json` 는 런타임 산출물이므로 커밋하지 않는 것을 권장합니다.
-- 음악 파일(wav 등)은 용량이 커질 수 있어 Git LFS를 고려하거나 `.gitignore`로 제외하는 것을 추천합니다.
+`.env` 파일 또는 시스템 환경 변수로 설정 가능합니다.
+
+| 변수명 | 설명 | 기본값 |
+| --- | --- | --- |
+| `SECRET_KEY` | JWT 서명 및 보안 키 (프로덕션 필수 설정) | (Random UUID) |
+| `FLASK_DEBUG` | 디버그 모드 활성화 여부 (`1`: On) | `1` |
+| `ENABLE_PERIODIC_EXECUTE` | 백그라운드 작업 큐 자동 실행 여부 | `1` |
+| `EXECUTE_INTERVAL_SECONDS` | 작업 큐 폴링 간격 (초) | `2` |
+| `MAX_JOBS_PER_RUN` | 한 번에 처리할 최대 작업 수 | `5` |
+| `KEYWORDS_HISTORY_PATH` | 키워드 히스토리 파일 경로 | `defaults/keywords_history.json` |
+
+---
+
+## API 명세 요약
+
+모든 보안 엔드포인트는 헤더에 `Authorization: Bearer <access_token>`이 필요합니다.
+
+### 1. 인증 (Auth)
+
+* `POST /register`: 회원가입 (`username`, `email`, `password`, `code`)
+* `POST /login`: 로그인 (`access_token`, `refresh_token` 발급)
+* `POST /refresh`: 액세스 토큰 갱신
+* `POST /logout`: 로그아웃 (토큰 만료 처리)
+* `POST /send_code` & `/verify_code`: 이메일 인증 (현재 콘솔 출력으로 코드 확인)
+
+### 2. 도서 관리 (Library)
+
+* `POST /upload_book`: PDF 파일 업로드 및 분석 요청 (Multipart)
+* 응답: `202 Accepted`, `job_id` 반환
+
+
+* `POST /my_books`: 내 서재 목록 조회 (표지 URL 포함)
+* `POST /get_toc`: 특정 도서의 목차(Table of Contents) 조회
+* `POST /delete_server_book`: 서버에서 도서 데이터 삭제
+
+### 3. 파일 및 리소스 (Files)
+
+* `GET /list_music_files/<username>/<book_title>`: 해당 도서에 매핑된 음악 파일명 목록 조회
+* `GET /files/<username>/<book_folder>/<filename>`: 도서 관련 파일(이미지, JSON 등) 다운로드
+* `GET /files/<username>/<book_folder>/music/<filename>`: **음악 파일 다운로드** (공용 스토리지에서 서빙)
