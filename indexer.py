@@ -4,6 +4,8 @@ import librosa
 import numpy as np
 import warnings
 import hashlib
+import shutil
+from filelock import FileLock, Timeout  # pip install filelock 필요
 
 # 경고 무시
 warnings.filterwarnings('ignore')
@@ -13,6 +15,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS_DIR = os.path.join(BASE_DIR, 'defaults')
 MUSIC_FOLDER = os.path.join(DEFAULTS_DIR, 'music')
 INDEX_FILE = os.path.join(DEFAULTS_DIR, 'music_index.json')
+LOCK_FILE = os.path.join(DEFAULTS_DIR, 'music_index.json.lock')  # 락 파일 경로 추가
 
 
 def analyze_audio(file_path):
@@ -48,9 +51,21 @@ def create_music_index():
         os.makedirs(MUSIC_FOLDER, exist_ok=True)
         return
 
-    # =========================================================
-    # [수정됨] 하위 폴더(storage_xxx)까지 재귀 탐색 (os.walk)
-    # =========================================================
+    # 락 획득 시도 (최대 60초 대기)
+    try:
+        with FileLock(LOCK_FILE, timeout=60):
+            _process_indexing_critical_section()
+    except Timeout:
+        print("❌ [Indexer] 인덱스 파일 락 획득 실패 (Timeout). 다른 프로세스가 작업 중입니다.")
+    except Exception as e:
+        print(f"❌ [Indexer] 오류 발생: {e}")
+
+
+def _process_indexing_critical_section():
+    """
+    락이 걸린 상태에서 안전하게 실행되는 실제 인덱싱 로직
+    """
+    # 2. 디스크 파일 스캔 (하위 폴더 포함)
     valid_extensions = ('.wav', '.mp3', '.m4a', '.flac', '.ogg')
 
     # disk_files_map: { "파일명": "전체경로" }
@@ -59,8 +74,6 @@ def create_music_index():
     for root, dirs, files in os.walk(MUSIC_FOLDER):
         for file in files:
             if file.lower().endswith(valid_extensions):
-                # 파일명 중복 방지를 위해 덮어쓰거나,
-                # 해시 기반이라 중복이 없다고 가정
                 full_path = os.path.join(root, file)
                 disk_files_map[file] = full_path
 
@@ -80,7 +93,6 @@ def create_music_index():
     # 4. [정리] 디스크에서 삭제된 파일 제거
     ids_to_remove = []
     for key, val in index_data.items():
-        # 인덱스에 있는 파일명이 현재 디스크 맵에 없으면 삭제 대상
         if val.get('filename') not in disk_files_map:
             ids_to_remove.append(key)
 
@@ -92,8 +104,6 @@ def create_music_index():
 
     # 5. [추가] 신규 파일 인덱싱
     registered_filenames = {v['filename'] for v in index_data.values()}
-
-    # 아직 등록되지 않은 파일명만 골라냄
     new_filenames = [f for f in disk_files_map.keys() if f not in registered_filenames]
 
     if new_filenames:
@@ -102,7 +112,6 @@ def create_music_index():
     for i, filename in enumerate(new_filenames):
         print(f"   [{i + 1}/{len(new_filenames)}] {filename} ... ", end='', flush=True)
 
-        # 전체 경로를 맵에서 가져옴 (하위 폴더 어딘가에 있음)
         file_path = disk_files_map[filename]
         json_path = os.path.splitext(file_path)[0] + ".json"
 
@@ -111,7 +120,7 @@ def create_music_index():
         prompt = ""
         bpm = 0
 
-        # 사이드카 JSON 확인 (생성 시 같이 만들어진 json)
+        # 사이드카 JSON 확인
         if os.path.exists(json_path):
             try:
                 with open(json_path, 'r', encoding='utf-8') as jf:
@@ -131,7 +140,7 @@ def create_music_index():
         dur, detected_bpm = analyze_audio(file_path)
         if not bpm: bpm = detected_bpm
 
-        # ID 생성
+        # ID 생성 (해시 충돌 방지)
         file_hash = int(hashlib.md5(filename.encode()).hexdigest(), 16) % 10000000
         while str(file_hash) in index_data:
             file_hash += 1
@@ -139,7 +148,7 @@ def create_music_index():
         index_data[str(file_hash)] = {
             "id": file_hash,
             "genre": genre,
-            "filename": filename,  # 파일명만 저장 (서버가 검색해서 서빙함)
+            "filename": filename,
             "duration": round(dur, 2),
             "bpm": int(round(bpm)),
             "prompt": prompt if prompt else f"{genre} mood music"
@@ -147,11 +156,21 @@ def create_music_index():
         changed = True
         print("Done.")
 
-    # 6. 저장
+    # 6. 저장 (Atomic Write 적용)
     if changed:
-        with open(INDEX_FILE, 'w', encoding='utf-8') as f:
-            json.dump(index_data, f, indent=2, ensure_ascii=False)
-        print(f"✅ 인덱싱 완료! (총 {len(index_data)}개)")
+        try:
+            # (1) 임시 파일에 먼저 쓰기
+            temp_file = INDEX_FILE + ".tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(index_data, f, indent=2, ensure_ascii=False)
+
+            # (2) 원자적 교체 (운영체제 레벨에서 안전함)
+            os.replace(temp_file, INDEX_FILE)
+            print(f"✅ 인덱싱 완료 및 저장됨! (총 {len(index_data)}개)")
+        except Exception as e:
+            print(f"❌ 인덱스 저장 실패: {e}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
     else:
         print("✅ 변경 사항 없음.")
 

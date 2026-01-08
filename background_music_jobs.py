@@ -13,6 +13,8 @@ import threading
 import uuid
 import hashlib
 import importlib.util
+import shutil
+from filelock import FileLock  # [필수] pip install filelock
 
 import nltk
 from nltk.corpus import wordnet
@@ -39,14 +41,11 @@ except LookupError:
 # =========================================================
 # [Cache & Paths]
 # =========================================================
-_KEYWORDS_HISTORY_LOCK = threading.Lock()
 _BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 _DEFAULTS_DIR = os.path.join(_BASE_DIR, "defaults")
 _MUSIC_DEFAULTS_DIR = os.path.join(_DEFAULTS_DIR, "music")
 
 _KEYWORDS_HISTORY_PATH = os.environ.get("KEYWORDS_HISTORY_PATH") or os.path.join(_DEFAULTS_DIR, "keywords_history.json")
-
-# [설정] 스토리지 폴더 당 최대 파일 개수
 MAX_FILES_PER_FOLDER = 1000
 
 
@@ -61,27 +60,6 @@ def _normalize_keywords(keywords):
         seen.add(k2)
         out.append(k2)
     return out[:5]
-
-
-def _load_keywords_history() -> dict:
-    try:
-        if os.path.exists(_KEYWORDS_HISTORY_PATH):
-            with open(_KEYWORDS_HISTORY_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except:
-        return {}
-    return {}
-
-
-def _save_keywords_history(hist: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(_KEYWORDS_HISTORY_PATH), exist_ok=True)
-        tmp = _KEYWORDS_HISTORY_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(hist, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _KEYWORDS_HISTORY_PATH)
-    except:
-        pass
 
 
 def _prompt_signature(prompt, genre, bpm, keywords, target_duration_sec, segment_duration):
@@ -424,8 +402,6 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                 try:
                     current_name = str(segment.get("music_filename", "") or "")
 
-                    # [중요] 기존 파일이 있어도 무시하고 생성하도록 해당 체크 로직 제거됨.
-
                     pages = segment.get("pages", []) or []
                     texts = [p.get("text", "").strip() for p in pages if isinstance(p, dict)]
                     combined_text = " ".join(texts).strip()
@@ -445,6 +421,7 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                     sig = _prompt_signature(prompt, genre, int(bpm), norm_keywords, target_duration, seg_dur)
                     filename = f"{sig}.wav"
 
+                    # 1. 1차 확인 (락 없이)
                     master_path = find_master_file(filename)
                     music_source = "ai_gen"
 
@@ -452,28 +429,47 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                         print(f"♻️ [Reuse] Found in storage: {master_path}")
                         music_source = "ai_reused"
                     else:
-                        print(f"🎹 [New] Generating: {filename}")
-                        audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
+                        # 2. 파일 락을 통한 안전한 생성 (Double Checked Locking)
+                        save_dir = get_storage_folder()
+                        lock_path = os.path.join(save_dir, f".{filename}.lock")
 
-                        if audio is not None and sr is not None:
-                            save_dir = get_storage_folder()
-                            master_path = os.path.join(save_dir, filename)
+                        print(f"🔒 [Lock] 파일 생성을 위해 락 획득 시도: {filename}")
+                        with FileLock(lock_path, timeout=300):
+                            # 2-1. 락 획득 후 다시 확인 (그 사이 누군가 만들었을 수 있음)
+                            master_path = find_master_file(filename)
 
-                            audio = np.clip(audio, -1.0, 1.0)
-                            audio_i16 = (audio * 32767).astype(np.int16)
-                            wavfile.write(master_path, sr, audio_i16)
+                            if master_path:
+                                print(f"♻️ [Reuse] 락 대기 중 생성됨: {master_path}")
+                                music_source = "ai_reused"
+                            else:
+                                print(f"🎹 [New] Generating: {filename}")
+                                audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
 
-                            meta_path = master_path.replace(".wav", ".json")
-                            with open(meta_path, "w", encoding="utf-8") as mf:
-                                json.dump({
-                                    "prompt": prompt, "emotion": analysis.get("emotion"),
-                                    "genre": genre, "bpm": bpm, "keywords": norm_keywords
-                                }, mf, ensure_ascii=False, indent=2)
+                                if audio is not None and sr is not None:
+                                    target_path = os.path.join(save_dir, filename)
+                                    temp_path = target_path + ".tmp"
 
-                            print(f"💾 Saved to Storage: {master_path}")
-                        else:
-                            print("❌ Audio generation failed.")
-                            continue
+                                    # Atomic Write (임시 파일 -> 교체)
+                                    audio = np.clip(audio, -1.0, 1.0)
+                                    audio_i16 = (audio * 32767).astype(np.int16)
+                                    wavfile.write(temp_path, sr, audio_i16)
+                                    os.replace(temp_path, target_path)
+                                    master_path = target_path
+
+                                    # 메타데이터도 안전하게 저장
+                                    meta_path = master_path.replace(".wav", ".json")
+                                    temp_meta_path = meta_path + ".tmp"
+                                    with open(temp_meta_path, "w", encoding="utf-8") as mf:
+                                        json.dump({
+                                            "prompt": prompt, "emotion": analysis.get("emotion"),
+                                            "genre": genre, "bpm": bpm, "keywords": norm_keywords
+                                        }, mf, ensure_ascii=False, indent=2)
+                                    os.replace(temp_meta_path, meta_path)
+
+                                    print(f"💾 Saved to Storage: {master_path}")
+                                else:
+                                    print("❌ Audio generation failed.")
+                                    continue
 
                     segment["music_filename"] = filename
                     segment["music_path"] = f"music/{filename}"
@@ -491,6 +487,7 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
 
         if updated:
             try:
+                # JSON 파일 업데이트도 안전하게
                 tmp_path = path + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
@@ -500,163 +497,165 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                 print(f"❌ Failed to update JSON file: {e}")
 
 
+# =========================================================
+# [Job Runner with DB Support]
+# =========================================================
 class BackgroundMusicJobRunner:
-    def __init__(self, users_folder, queue_file=None):
+    def __init__(self, users_folder, db_instance, job_model):
         self.users_folder = users_folder
-        self.queue_file = queue_file or os.path.join(users_folder, "_bg_jobs.json")
-        self._lock = threading.Lock()
-        self._jobs = []
-        self._load()
+        self.db = db_instance
+        self.JobModel = job_model
 
-        # [추가됨] 서버 켜질 때 'running' 상태인 작업 복구 (Zombie Jobs Recovery)
-        self._recover_stuck_jobs()
-
-    def _load(self):
+    def recover_stuck_jobs(self):
+        """
+        서버 재시작 시 'running' 상태인 작업을 'queued'로 복구
+        """
         try:
-            if os.path.exists(self.queue_file):
-                with open(self.queue_file, "r", encoding="utf-8") as f:
-                    self._jobs = json.load(f)
-            else:
-                self._jobs = []
-        except:
-            self._jobs = []
-
-    def _save(self):
-        try:
-            os.makedirs(os.path.dirname(self.queue_file), exist_ok=True)
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump(self._jobs, f, ensure_ascii=False, indent=2)
-        except:
-            pass
-
-    # [추가됨] 중단된 작업 복구 메서드
-    def _recover_stuck_jobs(self):
-        with self._lock:
-            self._load()
-            recovered_count = 0
-            for job in self._jobs:
-                # 상태가 'running'인 채로 멈춰있는 녀석들을 찾음
-                if job.get("status") == "running":
-                    print(f"♻️ [Recovery] 중단된 작업 복구: {job.get('book_id')} (ID: {job.get('id')})")
-                    job["status"] = "queued"  # 다시 대기열로
-                    job["started_at"] = 0
-                    recovered_count += 1
-
-            if recovered_count > 0:
-                self._save()
-                print(f"✅ 총 {recovered_count}개의 중단된 작업을 대기열로 복구했습니다.")
+            stuck_jobs = self.JobModel.query.filter_by(status='running').all()
+            if stuck_jobs:
+                print(f"♻️ [Recovery] 중단된 작업 {len(stuck_jobs)}개 복구 중...")
+                for job in stuck_jobs:
+                    job.status = 'queued'
+                    job.started_at = None
+                self.db.session.commit()
+                print(f"✅ 복구 완료.")
+        except Exception as e:
+            print(f"❌ Recovery Failed: {e}")
+            self.db.session.rollback()
 
     def enqueue(self, job_type, username, book_id, json_path=None, music_folder=None,
                 web_path_prefix=None, pdf_path=None, book_root_folder=None):
-        with self._lock:
-            self._load()
+        try:
             job_id = str(uuid.uuid4())
-            new_job = {
-                "id": job_id,
-                "type": job_type,
-                "username": username,
-                "book_id": book_id,
-                "status": "queued",
-                "created_at": int(time.time()),
-                "json_path": json_path,
-                "music_folder": music_folder,
-                "web_path_prefix": web_path_prefix,
-                "pdf_path": pdf_path,
-                "book_root_folder": book_root_folder
-            }
-            self._jobs.append(new_job)
-            self._save()
+            new_job = self.JobModel(
+                id=job_id,
+                type=job_type,
+                user_uuid=user_uuid,
+                book_id=book_id,
+                status="queued",
+                json_path=json_path,
+                music_folder=music_folder,
+                web_path_prefix=web_path_prefix,
+                pdf_path=pdf_path,
+                book_root_folder=book_root_folder
+            )
+            self.db.session.add(new_job)
+            self.db.session.commit()
             return job_id
+        except Exception as e:
+            self.db.session.rollback()
+            print(f"❌ Enqueue Error: {e}")
+            return None
 
     def execute(self, max_jobs=1):
-        to_run = []
-        with self._lock:
-            self._load()
-            for j in self._jobs:
-                if j.get("status") == "queued":
-                    j["status"] = "running"
-                    j["started_at"] = int(time.time())
-                    to_run.append(j)
-                    if len(to_run) >= max_jobs: break
-            self._save()
+        """
+        DB에서 'queued' 작업을 가져와 실행.
+        동시성 제어를 위해 'queued' -> 'running' 업데이트를 먼저 수행.
+        """
+        processed_count = 0
 
-        ran = 0
-        for job in to_run:
-            ran += 1
-            status = "error"
-            err = None
+        # 최대 max_jobs 만큼 반복
+        for _ in range(max_jobs):
+            target_job = None
+
             try:
-                if job["type"] == "analyze" or job["type"] == "analyze_and_music":
-                    print(f"📘 [Job] Analyzing Book: {job.get('book_id', 'Unknown')}", flush=True)
+                # 1. 'queued' 작업 하나 찾기 (오래된 순)
+                candidate = self.JobModel.query.filter_by(status='queued').order_by(
+                    self.JobModel.created_at.asc()).first()
+
+                if not candidate:
+                    break  # 대기 중인 작업 없음
+
+                # 2. [Critical Section] 상태를 'running'으로 원자적 업데이트 시도
+                # filter 조건에 status='queued'를 다시 넣어, 그 사이 다른 스레드가 가져가지 않았는지 확인
+                rows_updated = self.JobModel.query.filter_by(id=candidate.id, status='queued').update({
+                    'status': 'running',
+                    'started_at': int(time.time())
+                })
+                self.db.session.commit()
+
+                if rows_updated == 0:
+                    # 다른 프로세스가 이미 가져감 -> 다음 루프
+                    continue
+
+                # 업데이트 성공, 작업 획득
+                target_job = self.JobModel.query.get(candidate.id)
+
+            except Exception as e:
+                self.db.session.rollback()
+                print(f"❌ DB Selection Error: {e}")
+                break
+
+            if not target_job:
+                continue
+
+            # 3. 작업 실행
+            processed_count += 1
+            status = "error"
+            err_msg = None
+
+            try:
+                if target_job.type == "analyze":
+                    print(f"📘 [Job] Analyzing Book: {target_job.book_id}")
                     try:
                         from analyzer import process_full_book_for_offline
-                    except ImportError:
-                        raise ImportError("analyzer.py module not found.")
-
-                    result = process_full_book_for_offline(
-                        pdf_path=job["pdf_path"],
-                        book_root_folder=job["book_root_folder"],
-                        music_folder=job["music_folder"],
-                        web_path_prefix=job["web_path_prefix"]
-                    )
-
-                    # [디버깅] 분석기 결과 출력
-                    print(f"   🔍 [Debug] 분석기 반환값: {result}", flush=True)
-
-                    if result and 'text_file' in result:
-                        full_json_path = os.path.join(job["book_root_folder"], result['text_file'])
-
-                        print(f"   ↪️ 분석 완료. 음악 생성 작업(Music)을 큐에 추가합니다.", flush=True)
-                        self.enqueue(
-                            job_type='music',
-                            username=job["username"],
-                            book_id=job["book_id"],
-                            json_path=full_json_path,
-                            music_folder=job["music_folder"],
-                            web_path_prefix=job["web_path_prefix"]
+                        result = process_full_book_for_offline(
+                            pdf_path=target_job.pdf_path,
+                            book_root_folder=target_job.book_root_folder,
+                            music_folder=target_job.music_folder,
+                            web_path_prefix=target_job.web_path_prefix
                         )
-                    status = "done"
 
-                elif job["type"] == "music":
-                    print(f"🎹 [Job] Generating Music: {job.get('book_id', 'Unknown')}", flush=True)
+                        if result and 'text_file' in result:
+                            full_json_path = os.path.join(target_job.book_root_folder, result['text_file'])
 
+                            # 후속 'music' 작업 등록
+                            self.enqueue(
+                                job_type='music',
+                                username=target_job.username,
+                                book_id=target_job.book_id,
+                                json_path=full_json_path,
+                                music_folder=target_job.music_folder,
+                                web_path_prefix=target_job.web_path_prefix
+                            )
+                        status = "done"
+                    except ImportError:
+                        err_msg = "analyzer module missing"
+                    except Exception as e:
+                        err_msg = str(e)
+
+                elif target_job.type == "music":
+                    print(f"🎹 [Job] Generating Music: {target_job.book_id}")
                     process_book_background(
-                        job["json_path"],
-                        job["music_folder"],
-                        job["web_path_prefix"],
-                        job.get("username"),
-                        job.get("book_id")
+                        target_job.json_path,
+                        target_job.music_folder,
+                        target_job.web_path_prefix,
+                        target_job.username,
+                        target_job.book_id
                     )
-
                     if create_music_index:
                         try:
                             create_music_index()
                         except:
                             pass
-
-                    print(f"🎹 [Job] Generating Music Finished!", flush=True)
                     status = "done"
                 else:
-                    print(f"⚠️ [Job] 알 수 없는 작업 타입: {job['type']}", flush=True)
                     status = "skipped"
 
             except Exception as e:
-                err = str(e)
-                print(f"❌ Job Failed: {e}", flush=True)
+                err_msg = str(e)
+                print(f"❌ Job Execution Failed: {e}")
                 import traceback
                 traceback.print_exc()
 
-            with self._lock:
-                self._load()
-                for j in self._jobs:
-                    if j.get("id") == job.get("id"):
-                        j["status"] = status
-                        j["finished_at"] = int(time.time())
-                        j["error"] = err
-                        break
+            # 4. 결과 저장
+            try:
+                target_job.status = status
+                target_job.finished_at = int(time.time())
+                target_job.error = err_msg
+                self.db.session.commit()
+            except Exception as e:
+                self.db.session.rollback()
+                print(f"❌ Failed to save job status: {e}")
 
-                # [청소] 완료된 작업(done, skipped)은 리스트에서 삭제
-                self._jobs = [j for j in self._jobs if j["status"] not in ["done", "skipped"]]
-                self._save()
-
-        return {"ran": ran}
+        return {"ran": processed_count}
