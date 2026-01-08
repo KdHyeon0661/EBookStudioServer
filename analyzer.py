@@ -327,6 +327,9 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
     """
     filename_base = os.path.splitext(os.path.basename(pdf_path))[0]
 
+    # [수정] 실제 폴더 이름 (예: test_pdf_ef01b1c8)
+    book_folder_name = os.path.basename(book_root_folder)
+
     # Mapper 초기화
     mapper = MusicMapper()
 
@@ -342,17 +345,28 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
         if len(doc) > 0:
             page = doc[0]
             pix = page.get_pixmap()
-            cover_save_name = f"{filename_base}.png"
+
+            # [수정] 파일명이 아닌 '폴더명.png'로 저장 (클라이언트 요청 대응)
+            cover_save_name = f"{book_folder_name}.png"
+
             cover_path = os.path.join(book_root_folder, cover_save_name)
             pix.save(cover_path)
             cover_filename = cover_save_name
+            print(f"[Analyzer] Cover saved: {cover_path}")
     except:
         pass
 
     # 2. 본문 분석
-    real_author, start_page = find_start_page_and_author(doc)
+    # 저자는 찾되, start_page는 무시하고 0으로 설정
+    real_author, _ = find_start_page_and_author(doc)
+
+    # [수정] 앞부분(10줄)이 사라지지 않도록 무조건 0페이지부터 시작
+    start_page = 0
+
     real_author = sanitize_author(real_author)
     font_info = analyze_font_characteristics(doc)
+
+    # start_page=0 이므로 모든 페이지를 분석합니다.
     raw_chapters_data = extract_chapters_by_font_size(doc, font_info, start_page)
     final_chapters = []
 

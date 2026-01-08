@@ -15,7 +15,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS_DIR = os.path.join(BASE_DIR, 'defaults')
 MUSIC_FOLDER = os.path.join(DEFAULTS_DIR, 'music')
 INDEX_FILE = os.path.join(DEFAULTS_DIR, 'music_index.json')
-LOCK_FILE = os.path.join(DEFAULTS_DIR, 'music_index.json.lock')  # 락 파일 경로 추가
+LOCK_FILE = os.path.join(DEFAULTS_DIR, 'music_index.json.lock')
 
 
 def analyze_audio(file_path):
@@ -39,13 +39,13 @@ def analyze_audio(file_path):
 
         return duration, float(tempo)
     except Exception as e:
-        print(f"   ⚠️ 분석 실패 ({os.path.basename(file_path)}): {e}")
+        print(f"[Error] Analysis failed ({os.path.basename(file_path)}): {e}")
         return 0.0, 0.0
 
 
 def create_music_index():
-    print(f"🚀 Indexer 시작")
-    print(f"📂 스캔 대상: {MUSIC_FOLDER} (하위 폴더 포함)")
+    print(f"[Indexer] Start")
+    print(f"[Indexer] Scanning target: {MUSIC_FOLDER}")
 
     if not os.path.exists(MUSIC_FOLDER):
         os.makedirs(MUSIC_FOLDER, exist_ok=True)
@@ -56,9 +56,9 @@ def create_music_index():
         with FileLock(LOCK_FILE, timeout=60):
             _process_indexing_critical_section()
     except Timeout:
-        print("❌ [Indexer] 인덱스 파일 락 획득 실패 (Timeout). 다른 프로세스가 작업 중입니다.")
+        print("[Indexer] Failed to acquire lock (Timeout). Another process is running.")
     except Exception as e:
-        print(f"❌ [Indexer] 오류 발생: {e}")
+        print(f"[Indexer] Error: {e}")
 
 
 def _process_indexing_critical_section():
@@ -77,7 +77,7 @@ def _process_indexing_critical_section():
                 full_path = os.path.join(root, file)
                 disk_files_map[file] = full_path
 
-    print(f"🔎 전체 오디오 파일 발견: {len(disk_files_map)}개")
+    print(f"[Indexer] Total audio files found: {len(disk_files_map)}")
 
     # 3. 기존 인덱스 로드
     index_data = {}
@@ -97,7 +97,7 @@ def _process_indexing_critical_section():
             ids_to_remove.append(key)
 
     if ids_to_remove:
-        print(f"🧹 삭제된 파일 정리 중... ({len(ids_to_remove)}개 제거)")
+        print(f"[Indexer] Cleaning up {len(ids_to_remove)} removed files...")
         for key in ids_to_remove:
             del index_data[key]
         changed = True
@@ -107,7 +107,7 @@ def _process_indexing_critical_section():
     new_filenames = [f for f in disk_files_map.keys() if f not in registered_filenames]
 
     if new_filenames:
-        print(f"🆕 신규 파일 {len(new_filenames)}개 분석 시작...")
+        print(f"[Indexer] Analyzing {len(new_filenames)} new files...")
 
     for i, filename in enumerate(new_filenames):
         print(f"   [{i + 1}/{len(new_filenames)}] {filename} ... ", end='', flush=True)
@@ -166,13 +166,13 @@ def _process_indexing_critical_section():
 
             # (2) 원자적 교체 (운영체제 레벨에서 안전함)
             os.replace(temp_file, INDEX_FILE)
-            print(f"✅ 인덱싱 완료 및 저장됨! (총 {len(index_data)}개)")
+            print(f"[Indexer] Indexing completed and saved (Total {len(index_data)} items)")
         except Exception as e:
-            print(f"❌ 인덱스 저장 실패: {e}")
+            print(f"[Indexer] Failed to save index: {e}")
             if os.path.exists(temp_file):
                 os.remove(temp_file)
     else:
-        print("✅ 변경 사항 없음.")
+        print("[Indexer] No changes detected.")
 
 
 if __name__ == "__main__":

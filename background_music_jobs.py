@@ -14,7 +14,7 @@ import uuid
 import hashlib
 import importlib.util
 import shutil
-from filelock import FileLock  # [필수] pip install filelock
+from filelock import FileLock  # pip install filelock
 
 import nltk
 from nltk.corpus import wordnet
@@ -36,7 +36,7 @@ except LookupError:
         nltk.download('wordnet', quiet=True)
         nltk.download('omw-1.4', quiet=True)
     except Exception as e:
-        print(f"⚠️ NLTK Download Failed: {e}")
+        print(f"[NLTK] Download Failed: {e}")
 
 # =========================================================
 # [Cache & Paths]
@@ -182,14 +182,14 @@ def load_models():
             device = "cuda" if torch.cuda.is_available() else "cpu"
             music_model.to(device)
         except Exception as e:
-            print(f"❌ MusicGen Error: {e}")
+            print(f"[MusicGen] Error: {e}")
 
     if kw_model is None:
         print("[KeyBERT] Loading...")
         try:
             kw_model = KeyBERT('roberta-base')
         except Exception as e:
-            print(f"❌ KeyBERT Error: {e}")
+            print(f"[KeyBERT] Error: {e}")
 
     if emotion_classifier is None:
         print("[RoBERTa] Loading...")
@@ -200,7 +200,7 @@ def load_models():
                 device=0 if torch.cuda.is_available() else -1
             )
         except Exception as e:
-            print(f"❌ Emotion Classifier Error: {e}")
+            print(f"[Emotion Classifier] Error: {e}")
 
 
 def analyze_text_with_keybert_roberta(text):
@@ -320,7 +320,7 @@ def create_dynamic_music_prompt(analysis: dict):
 def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if music_model is None or processor is None:
-        print("❌ Model not loaded.")
+        print("[MusicGen] Model not loaded.")
         return None, None
 
     sampling_rate = music_model.config.audio_encoder.sampling_rate
@@ -355,10 +355,10 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
             elapsed = time.time() - start_time
-            print(f"         ⏳ Chunk {i + 1}/{num_chunks} 생성 완료 ({elapsed:.1f}초 소요)")
+            print(f"         [MusicGen] Chunk {i + 1}/{num_chunks} Generated ({elapsed:.1f}s)")
             time.sleep(0.5)
         except Exception as e:
-            print(f"         ❌ Chunk {i + 1} fail: {e}")
+            print(f"         [MusicGen] Chunk {i + 1} fail: {e}")
             continue
 
     if final_audio is not None and len(final_audio) > 0:
@@ -384,7 +384,7 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            print(f"⚠️ Failed to load JSON {path}: {e}")
+            print(f"[Process] Failed to load JSON {path}: {e}")
             continue
 
         updated = False
@@ -407,12 +407,12 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                     combined_text = " ".join(texts).strip()
                     if not combined_text: continue
 
-                    print(f"🔍 [Analyzing] Ch{ci}-Seg{si} ({len(combined_text)} chars)")
+                    print(f"[Analyze] Ch{ci}-Seg{si} ({len(combined_text)} chars)")
 
                     analysis = analyze_text_with_keybert_roberta(combined_text)
                     prompt, genre, bpm = create_dynamic_music_prompt(analysis)
 
-                    print(f"   👉 Mood: {analysis.get('emotion')} | Genre: {genre} | BPM: {bpm}")
+                    print(f"   [Prompt] Mood: {analysis.get('emotion')} | Genre: {genre} | BPM: {bpm}")
 
                     target_duration = 120
                     seg_dur = 30
@@ -426,23 +426,23 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                     music_source = "ai_gen"
 
                     if master_path:
-                        print(f"♻️ [Reuse] Found in storage: {master_path}")
+                        print(f"[Reuse] Found in storage: {master_path}")
                         music_source = "ai_reused"
                     else:
                         # 2. 파일 락을 통한 안전한 생성 (Double Checked Locking)
                         save_dir = get_storage_folder()
                         lock_path = os.path.join(save_dir, f".{filename}.lock")
 
-                        print(f"🔒 [Lock] 파일 생성을 위해 락 획득 시도: {filename}")
+                        print(f"[Lock] Acquiring lock for: {filename}")
                         with FileLock(lock_path, timeout=300):
                             # 2-1. 락 획득 후 다시 확인 (그 사이 누군가 만들었을 수 있음)
                             master_path = find_master_file(filename)
 
                             if master_path:
-                                print(f"♻️ [Reuse] 락 대기 중 생성됨: {master_path}")
+                                print(f"[Reuse] Created during wait: {master_path}")
                                 music_source = "ai_reused"
                             else:
-                                print(f"🎹 [New] Generating: {filename}")
+                                print(f"[Gen] Generating new: {filename}")
                                 audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
 
                                 if audio is not None and sr is not None:
@@ -466,9 +466,9 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                                         }, mf, ensure_ascii=False, indent=2)
                                     os.replace(temp_meta_path, meta_path)
 
-                                    print(f"💾 Saved to Storage: {master_path}")
+                                    print(f"[Save] Saved to Storage: {master_path}")
                                 else:
-                                    print("❌ Audio generation failed.")
+                                    print("[Error] Audio generation failed.")
                                     continue
 
                     segment["music_filename"] = filename
@@ -492,9 +492,9 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 os.replace(tmp_path, path)
-                print(f"✅ JSON Updated: {os.path.basename(path)}")
+                print(f"[Update] JSON Updated: {os.path.basename(path)}")
             except Exception as e:
-                print(f"❌ Failed to update JSON file: {e}")
+                print(f"[Error] Failed to update JSON file: {e}")
 
 
 # =========================================================
@@ -513,17 +513,17 @@ class BackgroundMusicJobRunner:
         try:
             stuck_jobs = self.JobModel.query.filter_by(status='running').all()
             if stuck_jobs:
-                print(f"♻️ [Recovery] 중단된 작업 {len(stuck_jobs)}개 복구 중...")
+                print(f"[Recovery] Recovering {len(stuck_jobs)} stuck jobs...")
                 for job in stuck_jobs:
                     job.status = 'queued'
                     job.started_at = None
                 self.db.session.commit()
-                print(f"✅ 복구 완료.")
+                print(f"[Recovery] Done.")
         except Exception as e:
-            print(f"❌ Recovery Failed: {e}")
+            print(f"[Recovery] Failed: {e}")
             self.db.session.rollback()
 
-    def enqueue(self, job_type, username, book_id, json_path=None, music_folder=None,
+    def enqueue(self, job_type, user_uuid, book_id, json_path=None, music_folder=None,
                 web_path_prefix=None, pdf_path=None, book_root_folder=None):
         try:
             job_id = str(uuid.uuid4())
@@ -544,7 +544,7 @@ class BackgroundMusicJobRunner:
             return job_id
         except Exception as e:
             self.db.session.rollback()
-            print(f"❌ Enqueue Error: {e}")
+            print(f"[Enqueue] Error: {e}")
             return None
 
     def execute(self, max_jobs=1):
@@ -583,7 +583,7 @@ class BackgroundMusicJobRunner:
 
             except Exception as e:
                 self.db.session.rollback()
-                print(f"❌ DB Selection Error: {e}")
+                print(f"[DB] Selection Error: {e}")
                 break
 
             if not target_job:
@@ -596,7 +596,7 @@ class BackgroundMusicJobRunner:
 
             try:
                 if target_job.type == "analyze":
-                    print(f"📘 [Job] Analyzing Book: {target_job.book_id}")
+                    print(f"[Job] Analyzing Book: {target_job.book_id}")
                     try:
                         from analyzer import process_full_book_for_offline
                         result = process_full_book_for_offline(
@@ -610,9 +610,10 @@ class BackgroundMusicJobRunner:
                             full_json_path = os.path.join(target_job.book_root_folder, result['text_file'])
 
                             # 후속 'music' 작업 등록
+                            # [수정] user_uuid를 전달해야 함
                             self.enqueue(
                                 job_type='music',
-                                username=target_job.username,
+                                user_uuid=target_job.user_uuid,
                                 book_id=target_job.book_id,
                                 json_path=full_json_path,
                                 music_folder=target_job.music_folder,
@@ -625,12 +626,12 @@ class BackgroundMusicJobRunner:
                         err_msg = str(e)
 
                 elif target_job.type == "music":
-                    print(f"🎹 [Job] Generating Music: {target_job.book_id}")
+                    print(f"[Job] Generating Music: {target_job.book_id}")
                     process_book_background(
                         target_job.json_path,
                         target_job.music_folder,
                         target_job.web_path_prefix,
-                        target_job.username,
+                        target_job.user_uuid,
                         target_job.book_id
                     )
                     if create_music_index:
@@ -644,7 +645,7 @@ class BackgroundMusicJobRunner:
 
             except Exception as e:
                 err_msg = str(e)
-                print(f"❌ Job Execution Failed: {e}")
+                print(f"[Job] Execution Failed: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -656,6 +657,6 @@ class BackgroundMusicJobRunner:
                 self.db.session.commit()
             except Exception as e:
                 self.db.session.rollback()
-                print(f"❌ Failed to save job status: {e}")
+                print(f"[DB] Failed to save job status: {e}")
 
         return {"ran": processed_count}
