@@ -320,17 +320,16 @@ def split_into_full_pages(text, words_per_page=300):
 # =========================================================
 def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_path_prefix):
     """
-    [Folder Structure Aware]
-    - book_root_folder: users/{id}/{book} -> 책 데이터(JSON, PNG) 저장
-    - music_folder: (인자로는 받지만, 음악 파일 저장에는 사용하지 않음)
-    - JSON Output: music_path = "music/{filename}" -> 클라이언트가 공용 music 폴더 참조
+    [Fast Track Analysis]
+    PDF를 분석하여 즉시 서비스 가능한 JSON을 생성합니다.
+    - 기존 음악 인덱스(preset)를 최우선으로 매핑합니다.
+    - 매핑 실패 시 'neutral' 또는 '기본 파일'을 할당하여 사용자 대기 시간을 없앱니다.
+    - 추후 라이브러리 확장을 위해 'generation_hint'를 JSON에 남깁니다.
     """
     filename_base = os.path.splitext(os.path.basename(pdf_path))[0]
-
-    # [수정] 실제 폴더 이름 (예: test_pdf_ef01b1c8)
     book_folder_name = os.path.basename(book_root_folder)
 
-    # Mapper 초기화
+    # Mapper 초기화 (기존 인덱스 로드)
     mapper = MusicMapper()
 
     try:
@@ -339,16 +338,13 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
         print(f"[Analyzer] PDF 열기 실패: {e}")
         raise e
 
-    # 1. 표지 추출 -> book_root_folder(책 폴더)에 바로 저장
+    # 1. 표지 추출
     cover_filename = "default.png"
     try:
         if len(doc) > 0:
             page = doc[0]
             pix = page.get_pixmap()
-
-            # [수정] 파일명이 아닌 '폴더명.png'로 저장 (클라이언트 요청 대응)
             cover_save_name = f"{book_folder_name}.png"
-
             cover_path = os.path.join(book_root_folder, cover_save_name)
             pix.save(cover_path)
             cover_filename = cover_save_name
@@ -356,22 +352,18 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
     except:
         pass
 
-    # 2. 본문 분석
-    # 저자는 찾되, start_page는 무시하고 0으로 설정
+    # 2. 본문 분석 (저자, 챕터)
     real_author, _ = find_start_page_and_author(doc)
-
-    # [수정] 앞부분(10줄)이 사라지지 않도록 무조건 0페이지부터 시작
     start_page = 0
-
     real_author = sanitize_author(real_author)
     font_info = analyze_font_characteristics(doc)
 
-    # start_page=0 이므로 모든 페이지를 분석합니다.
     raw_chapters_data = extract_chapters_by_font_size(doc, font_info, start_page)
     final_chapters = []
 
     print(f"[Analyzer] {filename_base} 처리 시작 - 총 {len(raw_chapters_data)} 챕터")
 
+    # 3. 챕터 및 세그먼트 매핑 루프
     for ch_idx, ch_data in enumerate(raw_chapters_data):
         chapter_title = ch_data['title']
         chapter_text = ch_data['text']
@@ -388,36 +380,53 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
                 "is_new_segment": (len(pages_buffer) == 0)
             })
 
-            # 세그먼트 생성
+            # 세그먼트 생성 (3페이지 단위 또는 챕터 끝)
             if len(pages_buffer) >= 3 or p_idx == len(chapter_pages) - 1:
                 combined_text = " ".join([p['text'] for p in pages_buffer])
+
+                # (A) 텍스트 감정 분석 (CPU 작업)
                 vibe = mapper.analyze_vibe(combined_text)
 
-                # Preset 음악 매칭 시도
+                # (B) 즉시 서비스용 음악 매핑 (1차 시도: 정확한 매칭)
                 music_info = mapper.get_music(vibe)
 
-                music_filename = None
-                music_bpm = 0
-                final_music_path = None
-                music_source = "ai_generate"
+                # (C) [Fallback] 매칭 실패 시 'neutral' 시도
+                if not music_info:
+                    music_info = mapper.get_music('neutral')
 
+                # (D) [Final Fallback] 그래도 없으면 시스템 기본값 강제 할당
+                # 이렇게 해야 프론트엔드가 null 에러 없이 즉시 재생 가능
                 if music_info:
                     music_filename = music_info['filename']
                     music_bpm = music_info['bpm']
-
-                    # [핵심 경로 설정]
-                    # 서버/클라이언트 모두 "music/" 접두사를 보면 "공용 음악 폴더"를 참조함.
-                    # 책 폴더 내부에 music 폴더를 만들지 않음.
-                    final_music_path = f"music/{music_filename}"
                     music_source = "preset" if not music_info.get("is_custom") else "ai_reused"
+                    # 실제 파일 경로: music/파일명
+                    final_music_path = f"music/{music_filename}"
+                else:
+                    # 인덱스에 아무 파일도 없는 초기 상태 대비
+                    music_filename = "default_ambient.wav"
+                    music_bpm = 80
+                    music_source = "system_default"
+                    final_music_path = f"music/{music_filename}"
 
+                # (E) 세그먼트 데이터 조립
                 chapter_segments.append({
                     "segment_index": segment_idx,
                     "emotion": vibe,
-                    "music_filename": music_filename,  # None이면 BG Job이 AI 생성 후 채움
+
+                    # 프론트엔드용 (즉시 재생 가능)
+                    "music_filename": music_filename,
                     "music_path": final_music_path,
                     "music_source": music_source,
                     "bpm": music_bpm,
+
+                    # [백그라운드 워커용 힌트]
+                    # 나중에 GPU 워커가 이 필드를 보고 "아, 원래 슬픈 노래를 만들었어야 했구나" 하고 생성함
+                    "generation_hint": {
+                        "target_emotion": vibe,
+                        "keywords": TEXT_VIBE_KEYWORDS.get(vibe, [])[:5]
+                    },
+
                     "pages": pages_buffer
                 })
                 pages_buffer = []
@@ -429,8 +438,8 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
             "segments": chapter_segments
         })
 
+    # 4. 최종 JSON 저장
     clean_web_prefix = web_path_prefix.rstrip('/')
-
     book_data = {
         "book_info": {
             "title": filename_base,
@@ -449,6 +458,7 @@ def process_full_book_for_offline(pdf_path, book_root_folder, music_folder, web_
 
     doc.close()
 
+    # 성공 결과 반환 (서버가 이를 보고 상태를 'mapped'로 변경)
     return {
         "success": True,
         "text_file": full_json_filename,

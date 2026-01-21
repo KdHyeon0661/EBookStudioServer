@@ -370,131 +370,115 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
 
 
 def process_book_background(json_path, music_folder, web_path_prefix, username=None, book_id=None):
-    load_models()
+    """
+    [GPU Worker Only]
+    이미 분석이 완료된 JSON 파일을 읽어서,
+    'generation_hint'가 있는 세그먼트에 대해 실제로 새로운 AI 음악을 생성합니다.
+    생성된 음악은 공용 Storage에 저장되어 라이브러리를 확장합니다.
+    """
+    load_models()  # GPU 모델 로드 (MusicGen)
 
-    if os.path.isdir(json_path):
-        paths = [os.path.join(json_path, f) for f in os.listdir(json_path) if f.endswith(".json")]
-    else:
-        paths = [json_path]
+    if not os.path.exists(json_path):
+        print(f"[Gen] JSON not found: {json_path}")
+        return
 
-    for path in paths:
-        if not os.path.exists(path): continue
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[Gen] Failed to load JSON: {e}")
+        return
 
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"[Process] Failed to load JSON {path}: {e}")
-            continue
+    chapters = data.get("chapters", [])
+    if not chapters: return
 
-        updated = False
-        chapters = data.get("chapters", [])
+    print(f"[Gen] Start background generation for book: {book_id}")
 
-        if not chapters and isinstance(data.get("segments"), list):
-            chapters = [{"chapter_index": 0, "segments": data.get("segments")}]
+    # JSON의 모든 챕터/세그먼트를 순회하며 생성 작업 수행
+    for ci, chapter in enumerate(chapters):
+        segments = chapter.get("segments", []) or []
 
-        if not chapters: continue
+        for si, segment in enumerate(segments):
+            try:
+                # 1. 힌트 확인 (Analyzer가 남겨둔 메모)
+                hint = segment.get("generation_hint")
+                if not hint:
+                    continue  # 힌트가 없으면 생성할 필요 없음 (이미 완벽 매칭 등)
 
-        for ci, chapter in enumerate(chapters):
-            segments = chapter.get("segments", []) or []
+                # 2. 생성 파라미터 추출
+                # analyzer가 분석해둔 감정과 키워드를 그대로 사용 (다시 분석 X)
+                target_emotion = hint.get("target_emotion", "neutral")
+                keywords = hint.get("keywords", [])
 
-            for si, segment in enumerate(segments):
-                try:
-                    current_name = str(segment.get("music_filename", "") or "")
+                # 장르와 BPM은 랜덤성을 위해 여기서 다시 살짝 변주를 줄 수도 있고,
+                # 일관성을 위해 고정할 수도 있음. 여기서는 '다양성'을 위해 랜덤 선택 로직 활용.
+                # (이미 analyzer.py에도 있는 로직이지만, 독립적으로 수행)
+                fake_analysis_for_gen = {"emotion": target_emotion, "keywords": keywords}
+                prompt, genre, bpm = create_dynamic_music_prompt(fake_analysis_for_gen)
 
-                    pages = segment.get("pages", []) or []
-                    texts = [p.get("text", "").strip() for p in pages if isinstance(p, dict)]
-                    combined_text = " ".join(texts).strip()
-                    if not combined_text: continue
+                target_duration = 120
+                seg_dur = 30
+                norm_keywords = _normalize_keywords(keywords)
 
-                    print(f"[Analyze] Ch{ci}-Seg{si} ({len(combined_text)} chars)")
+                # 3. 파일 시그니처(해시) 생성
+                sig = _prompt_signature(prompt, genre, int(bpm), norm_keywords, target_duration, seg_dur)
+                filename = f"{sig}.wav"
 
-                    analysis = analyze_text_with_keybert_roberta(combined_text)
-                    prompt, genre, bpm = create_dynamic_music_prompt(analysis)
-
-                    print(f"   [Prompt] Mood: {analysis.get('emotion')} | Genre: {genre} | BPM: {bpm}")
-
-                    target_duration = 120
-                    seg_dur = 30
-                    norm_keywords = _normalize_keywords(analysis.get("keywords", []))
-
-                    sig = _prompt_signature(prompt, genre, int(bpm), norm_keywords, target_duration, seg_dur)
-                    filename = f"{sig}.wav"
-
-                    # 1. 1차 확인 (락 없이)
-                    master_path = find_master_file(filename)
-                    music_source = "ai_gen"
-
-                    if master_path:
-                        print(f"[Reuse] Found in storage: {master_path}")
-                        music_source = "ai_reused"
-                    else:
-                        # 2. 파일 락을 통한 안전한 생성 (Double Checked Locking)
-                        save_dir = get_storage_folder()
-                        lock_path = os.path.join(save_dir, f".{filename}.lock")
-
-                        print(f"[Lock] Acquiring lock for: {filename}")
-                        with FileLock(lock_path, timeout=300):
-                            # 2-1. 락 획득 후 다시 확인 (그 사이 누군가 만들었을 수 있음)
-                            master_path = find_master_file(filename)
-
-                            if master_path:
-                                print(f"[Reuse] Created during wait: {master_path}")
-                                music_source = "ai_reused"
-                            else:
-                                print(f"[Gen] Generating new: {filename}")
-                                audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
-
-                                if audio is not None and sr is not None:
-                                    target_path = os.path.join(save_dir, filename)
-                                    temp_path = target_path + ".tmp"
-
-                                    # Atomic Write (임시 파일 -> 교체)
-                                    audio = np.clip(audio, -1.0, 1.0)
-                                    audio_i16 = (audio * 32767).astype(np.int16)
-                                    wavfile.write(temp_path, sr, audio_i16)
-                                    os.replace(temp_path, target_path)
-                                    master_path = target_path
-
-                                    # 메타데이터도 안전하게 저장
-                                    meta_path = master_path.replace(".wav", ".json")
-                                    temp_meta_path = meta_path + ".tmp"
-                                    with open(temp_meta_path, "w", encoding="utf-8") as mf:
-                                        json.dump({
-                                            "prompt": prompt, "emotion": analysis.get("emotion"),
-                                            "genre": genre, "bpm": bpm, "keywords": norm_keywords
-                                        }, mf, ensure_ascii=False, indent=2)
-                                    os.replace(temp_meta_path, meta_path)
-
-                                    print(f"[Save] Saved to Storage: {master_path}")
-                                else:
-                                    print("[Error] Audio generation failed.")
-                                    continue
-
-                    segment["music_filename"] = filename
-                    segment["music_path"] = f"music/{filename}"
-                    segment["music_source"] = music_source
-                    segment["emotion"] = analysis.get("emotion", "neutral")
-                    segment["genre"] = genre
-                    if bpm != 0: segment["bpm"] = bpm
-
-                    updated = True
-                    time.sleep(0.5)
-
-                except Exception as e:
-                    print(f"[BG] Error in Segment {si}: {e}")
+                # 4. 중복 체크 (이미 누가 만들었으면 스킵)
+                master_path = find_master_file(filename)
+                if master_path:
+                    print(f"[Gen] Skip (Already exists): {filename}")
                     continue
 
-        if updated:
-            try:
-                # JSON 파일 업데이트도 안전하게
-                tmp_path = path + ".tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, path)
-                print(f"[Update] JSON Updated: {os.path.basename(path)}")
+                # 5. [GPU Heavy Task] 실제 음악 생성
+                # 파일 락을 걸어서 동시에 같은 음악을 만드는 것을 방지
+                save_dir = get_storage_folder()
+                lock_path = os.path.join(save_dir, f".{filename}.lock")
+
+                print(f"[Gen] Generating new music: {filename} (Genre: {genre})")
+
+                # FileLock으로 안전하게 생성
+                with FileLock(lock_path, timeout=300):
+                    # 락 얻은 후 다시 확인 (Double Check)
+                    if find_master_file(filename):
+                        continue
+
+                    audio, sr = generate_music_segments(prompt, target_duration, seg_dur)
+
+                    if audio is not None and sr is not None:
+                        target_path = os.path.join(save_dir, filename)
+                        temp_path = target_path + ".tmp"
+
+                        # Wav 저장
+                        audio = np.clip(audio, -1.0, 1.0)
+                        audio_i16 = (audio * 32767).astype(np.int16)
+                        wavfile.write(temp_path, sr, audio_i16)
+                        os.replace(temp_path, target_path)
+
+                        # 메타데이터 저장 (Indexer가 나중에 읽음)
+                        meta_path = target_path.replace(".wav", ".json")
+                        with open(meta_path, "w", encoding="utf-8") as mf:
+                            json.dump({
+                                "prompt": prompt,
+                                "emotion": target_emotion,
+                                "genre": genre,
+                                "bpm": bpm,
+                                "keywords": norm_keywords,
+                                "created_at": time.time()
+                            }, mf, ensure_ascii=False, indent=2)
+
+                        print(f"[Gen] Saved new asset: {target_path}")
+                    else:
+                        print("[Gen] Failed to generate audio.")
+
+                # GPU 과열 방지 및 다른 프로세스 양보를 위한 짧은 휴식
+                time.sleep(1.0)
+
             except Exception as e:
-                print(f"[Error] Failed to update JSON file: {e}")
+                print(f"[Gen] Error in Segment {si}: {e}")
+                continue
+
+    print(f"[Gen] Background generation finished for {book_id}")
 
 
 # =========================================================
@@ -547,27 +531,35 @@ class BackgroundMusicJobRunner:
             print(f"[Enqueue] Error: {e}")
             return None
 
-    def execute(self, max_jobs=1):
+    def execute(self, job_types=None, max_jobs=1):
         """
         DB에서 'queued' 작업을 가져와 실행.
-        동시성 제어를 위해 'queued' -> 'running' 업데이트를 먼저 수행.
+        job_types: 실행할 작업 타입 리스트 (예: ['analyze'] 또는 ['music_generation'])
+        - None일 경우 안전을 위해 실행하지 않거나 기본값 처리
         """
         processed_count = 0
+
+        # 워커 프로세스(CPU/GPU)에 따라 처리할 작업 타입을 필터링
+        if job_types is None:
+            target_types = ['analyze', 'music_generation']
+        else:
+            target_types = job_types
 
         # 최대 max_jobs 만큼 반복
         for _ in range(max_jobs):
             target_job = None
 
             try:
-                # 1. 'queued' 작업 하나 찾기 (오래된 순)
-                candidate = self.JobModel.query.filter_by(status='queued').order_by(
-                    self.JobModel.created_at.asc()).first()
+                # 1. 'queued' 작업 하나 찾기 (요청된 타입 중에서, 오래된 순)
+                candidate = self.JobModel.query.filter(
+                    self.JobModel.status == 'queued',
+                    self.JobModel.type.in_(target_types)
+                ).order_by(self.JobModel.created_at.asc()).first()
 
                 if not candidate:
                     break  # 대기 중인 작업 없음
 
-                # 2. [Critical Section] 상태를 'running'으로 원자적 업데이트 시도
-                # filter 조건에 status='queued'를 다시 넣어, 그 사이 다른 스레드가 가져가지 않았는지 확인
+                # 2. [Critical Section] 상태를 'running'으로 원자적 업데이트
                 rows_updated = self.JobModel.query.filter_by(id=candidate.id, status='queued').update({
                     'status': 'running',
                     'started_at': int(time.time())
@@ -595,10 +587,16 @@ class BackgroundMusicJobRunner:
             err_msg = None
 
             try:
+                # =========================================================
+                # [Case A] 분석 작업 (CPU Worker 담당)
+                # 목적: PDF -> JSON 변환 및 '기존 음악' 매핑 (사용자 서비스용)
+                # =========================================================
                 if target_job.type == "analyze":
-                    print(f"[Job] Analyzing Book: {target_job.book_id}")
+                    print(f"[Job-CPU] Analyzing Book: {target_job.book_id}")
                     try:
                         from analyzer import process_full_book_for_offline
+
+                        # (1) 분석 수행 (여기서 analyzer.py가 기존 음악을 찾아 매핑함)
                         result = process_full_book_for_offline(
                             pdf_path=target_job.pdf_path,
                             book_root_folder=target_job.book_root_folder,
@@ -609,24 +607,34 @@ class BackgroundMusicJobRunner:
                         if result and 'text_file' in result:
                             full_json_path = os.path.join(target_job.book_root_folder, result['text_file'])
 
-                            # 후속 'music' 작업 등록
-                            # [수정] user_uuid를 전달해야 함
+                            # (2) [핵심] 분석 완료 후, 라이브러리 확장을 위한 '음악 생성' 작업을 별도 큐에 등록
+                            # 사용자는 기다리지 않게 하고, 생성은 백그라운드(GPU)로 넘김
                             self.enqueue(
-                                job_type='music',
+                                job_type='music_generation',  # 타입 분리
                                 user_uuid=target_job.user_uuid,
                                 book_id=target_job.book_id,
                                 json_path=full_json_path,
                                 music_folder=target_job.music_folder,
                                 web_path_prefix=target_job.web_path_prefix
                             )
+                            print(f"[Job-CPU] Analysis Done. Music Generation queued for library expansion.")
+
+                        # 사용자에게 보여줄 데이터 준비 완료
                         status = "done"
                     except ImportError:
                         err_msg = "analyzer module missing"
                     except Exception as e:
                         err_msg = str(e)
 
-                elif target_job.type == "music":
-                    print(f"[Job] Generating Music: {target_job.book_id}")
+                # =========================================================
+                # [Case B] 음악 생성 작업 (GPU Worker 담당)
+                # 목적: 키워드 기반 신규 음악 생성 -> 라이브러리(Storage) 확장
+                # =========================================================
+                elif target_job.type == "music_generation":
+                    print(f"[Job-GPU] Generating New Music for Library: {target_job.book_id}")
+
+                    # (1) 음악 생성 로직 실행
+                    # 기존 음악이 매핑되어 있더라도, 다양성을 위해(또는 필요 시) 생성 로직 수행
                     process_book_background(
                         target_job.json_path,
                         target_job.music_folder,
@@ -634,12 +642,16 @@ class BackgroundMusicJobRunner:
                         target_job.user_uuid,
                         target_job.book_id
                     )
+
+                    # (2) 인덱스 갱신 (생성된 음악을 다음 사용자가 쓸 수 있도록 등록)
                     if create_music_index:
                         try:
                             create_music_index()
                         except:
                             pass
+
                     status = "done"
+
                 else:
                     status = "skipped"
 

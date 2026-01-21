@@ -346,9 +346,16 @@ def reset_password():
 @app.route('/upload_book', methods=['POST'])
 @jwt_required()
 def upload_book():
+    """
+    [변경] Fire-and-Forget 방식
+    1. 파일 저장
+    2. 'analyze' 작업 큐 등록
+    3. 즉시 Job ID 반환 (30초 타임아웃 해결)
+    """
     current_user_uuid = get_jwt_identity()
     if 'file' not in request.files: return jsonify({'message': 'No file part'}), 400
     file = request.files['file']
+
     if file and file.filename.lower().endswith('.pdf'):
         filename_safe = secure_filename(file.filename)
         filename_base = os.path.splitext(filename_safe)[0]
@@ -356,11 +363,13 @@ def upload_book():
         upload_uuid = str(uuid.uuid4())[:8]
         book_folder_name = f"{filename_base}_{upload_uuid}"
 
+        # 이전 버전 정리
         try:
             _safely_cleanup_old_versions(current_user_uuid, filename_base)
         except Exception as e:
             print(f"[Upload] Cleanup warning: {e}")
 
+        # 경로 설정
         save_dir = os.path.join(USERS_BASE_FOLDER, current_user_uuid, book_folder_name)
         music_folder = app.config['DEFAULTS_MUSIC_FOLDER']
         os.makedirs(save_dir, exist_ok=True)
@@ -371,6 +380,7 @@ def upload_book():
         client_username = _resolve_client_username(current_user_uuid)
         web_path_prefix = f"/files/{client_username}/{book_folder_name}"
 
+        # [핵심] 'analyze' 타입으로 등록 (CPU 워커가 가져감)
         job_id = bg_runner.enqueue(
             job_type='analyze',
             user_uuid=current_user_uuid,
@@ -381,14 +391,47 @@ def upload_book():
             web_path_prefix=web_path_prefix
         )
 
+        # [핵심] 처리를 기다리지 않고 즉시 응답 (HTTP 202 Accepted)
         return jsonify({
-            'message': 'Upload successful. Processing started.',
+            'message': 'Upload accepted. Processing started.',
             'job_id': job_id,
-            'book_title': filename_base,
+            'status': 'pending',
             'book_folder': book_folder_name
         }), 202
+
     return jsonify({'message': 'Invalid file type'}), 400
 
+
+@app.route('/check_status/<job_id>', methods=['GET'])
+@jwt_required()
+def check_status(job_id):
+    """
+    [신규] 폴링용 상태 확인 API
+    프론트엔드가 2~3초 간격으로 호출하여 'done'인지 확인
+    """
+    job = Job.query.filter_by(id=job_id).first()
+    if not job:
+        return jsonify({'status': 'unknown', 'message': 'Job not found'}), 404
+
+    response = {
+        'job_id': job.id,
+        'status': job.status,  # queued, running, done, error
+        'created_at': job.created_at,
+        'finished_at': job.finished_at
+    }
+
+    if job.status == 'done':
+        # 분석이 완료되었으면 JSON 파일명을 알려줌 (바로 로딩 가능)
+        # 생성(music_generation)은 뒷단에서 돌고 있으므로 신경 안 써도 됨
+        response['result'] = {
+            'book_folder': job.book_id,
+            'message': 'Analysis complete. Music mapped from library.'
+        }
+
+    elif job.status == 'error':
+        response['error'] = job.error
+
+    return jsonify(response), 200
 
 @app.route('/files/<username>/<book_folder>/music/<filename>')
 @jwt_required()
