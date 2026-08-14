@@ -22,7 +22,15 @@ pip-wheel-metadata/
 # Logs / cache
 *.log
 .cache/
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
 .ipynb_checkpoints/
+
+# Java / Maven build artifacts
+target/
+**/target/
 
 # IDE
 .vscode/
@@ -45,15 +53,24 @@ users/
 *.sqlite3
 
 # Any runtime/generated JSONs that may live outside users/
-defaults/keywords_history.json
-defaults/keywords_history.json.tmp
 *_bg_jobs.json
 *jobs*.json
 *result_cache*.json
-defaults/music_index.json
 
 # =========================
 # Music assets (DO NOT COMMIT)
 # =========================
 # Ignore the entire music folder (preset + generated)
-defaults/music/
+
+# Local runtime assets copied from python-worker/defaults
+/defaults/
+
+# Local environment files and generated secrets
+.env
+.env.docker
+.jwt-secret
+!.env.example
+!.env.docker.example
+
+# Local backups
+backups/

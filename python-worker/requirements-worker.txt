@@ -1,0 +1,8 @@
+pymupdf==1.26.7
+filelock>=3.16,<4
+librosa==0.11.0
+nltk==3.9.2
+numpy>=2.0,<2.4
+scipy>=1.16,<1.17
+torch==2.9.1
+transformers==4.57.3

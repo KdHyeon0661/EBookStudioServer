@@ -1,0 +1,11 @@
+{
+  "1": {
+    "id": 1,
+    "genre": "ambient",
+    "filename": "default_ambient.wav",
+    "duration": 20.0,
+    "bpm": 80,
+    "prompt": "calm neutral ambient background pad",
+    "is_custom": false
+  }
+}

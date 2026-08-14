@@ -1,0 +1,45 @@
+server:
+  port: ${SERVER_PORT:5000}
+
+spring:
+  application:
+    name: ebookstudio-server
+  datasource:
+    url: jdbc:sqlite:${EBOOK_DB_PATH:../users.db}
+    driver-class-name: org.sqlite.JDBC
+    hikari:
+      maximum-pool-size: 4
+      connection-init-sql: PRAGMA foreign_keys=ON
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+  mail:
+    host: ${SMTP_HOST:localhost}
+    port: ${SMTP_PORT:587}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: ${SMTP_AUTH:true}
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS:true}
+
+ebookstudio:
+  storage-root: ${EBOOK_STORAGE_ROOT:..}
+  jwt-secret: ${SECRET_KEY:}
+  access-token-seconds: ${ACCESS_TOKEN_SECONDS:3600}
+  refresh-token-seconds: ${REFRESH_TOKEN_SECONDS:604800}
+  verification-code-seconds: ${VERIFICATION_CODE_SECONDS:300}
+  verification-send-cooldown-seconds: ${VERIFICATION_SEND_COOLDOWN_SECONDS:60}
+  login-ip-limit: ${LOGIN_IP_LIMIT:30}
+  login-account-limit: ${LOGIN_ACCOUNT_LIMIT:10}
+  login-rate-window-seconds: ${LOGIN_RATE_WINDOW_SECONDS:900}
+  verification-ip-limit: ${VERIFICATION_IP_LIMIT:20}
+  verification-email-limit: ${VERIFICATION_EMAIL_LIMIT:5}
+  verification-rate-window-seconds: ${VERIFICATION_RATE_WINDOW_SECONDS:3600}
+  email-from: ${EMAIL_FROM:noreply@ebookstudio.local}
+  email-delivery-enabled: ${EMAIL_DELIVERY_ENABLED:false}
+  email-expose-development-code: ${EMAIL_EXPOSE_DEVELOPMENT_CODE:false}
+
+logging:
+  level:
+    org.springframework.security: INFO

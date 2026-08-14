@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  spring-test:
+    name: Spring Boot tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spring-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: spring-server/pom.xml
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+      - name: Run tests
+        run: ./mvnw -B -ntp test
+
+  python-test:
+    name: Python Worker tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: python-worker/requirements-test.txt
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Compile all Worker modules
+        run: python -m compileall -q .
+
+  compose-validate:
+    name: Docker Compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate source-build Compose profiles
+        run: |
+          docker compose config --quiet
+          docker compose --profile cpu-music config --quiet
+          docker compose --profile gpu config --quiet
+      - name: Validate image-deployment Compose profiles
+        run: |
+          docker compose --env-file .env.docker.example -f compose.deploy.yaml config --quiet
+          docker compose --env-file .env.docker.example -f compose.deploy.yaml --profile cpu-music config --quiet
+          docker compose --env-file .env.docker.example -f compose.deploy.yaml --profile gpu config --quiet
+
+  docker-build:
+    name: Build ${{ matrix.name }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Spring API
+            context: spring-server
+            build_args: ""
+            cache_scope: spring-api
+          - name: Analysis Worker
+            context: python-worker
+            build_args: REQUIREMENTS_FILE=requirements-analyzer.txt
+            cache_scope: analysis-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: false
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+

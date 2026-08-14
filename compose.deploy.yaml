@@ -1,0 +1,165 @@
+name: ebookstudio
+
+x-common-environment: &common-environment
+  EBOOK_DB_PATH: /data/users.db
+  EBOOK_STORAGE_ROOT: /data
+  JOB_STALE_SECONDS: ${JOB_STALE_SECONDS:-900}
+  JOB_HEARTBEAT_SECONDS: ${JOB_HEARTBEAT_SECONDS:-30}
+  JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+
+x-service-hardening: &service-hardening
+  restart: unless-stopped
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  data-init:
+    image: alpine:3.22
+    user: "0:0"
+    restart: "no"
+    command: ["sh", "-c", "mkdir -p /data /models && chown -R 10001:10001 /data /models"]
+    volumes:
+      - app-data:/data
+      - model-cache:/models
+    networks:
+      - backend
+
+  api:
+    <<: *service-hardening
+    image: ${IMAGE_PREFIX:-ghcr.io/example}/ebookstudio-api:${IMAGE_TAG:-latest}
+    environment:
+      <<: *common-environment
+      SERVER_PORT: 5000
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env.docker}
+      ACCESS_TOKEN_SECONDS: ${ACCESS_TOKEN_SECONDS:-3600}
+      REFRESH_TOKEN_SECONDS: ${REFRESH_TOKEN_SECONDS:-604800}
+      EMAIL_DELIVERY_ENABLED: ${EMAIL_DELIVERY_ENABLED:-false}
+      EMAIL_EXPOSE_DEVELOPMENT_CODE: ${EMAIL_EXPOSE_DEVELOPMENT_CODE:-false}
+      EMAIL_FROM: ${EMAIL_FROM:-noreply@ebookstudio.local}
+      SMTP_HOST: ${SMTP_HOST:-localhost}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_AUTH: ${SMTP_AUTH:-true}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+    ports:
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-5000}:5000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: ${API_MEMORY_LIMIT:-768m}
+
+  analysis-worker:
+    <<: *service-hardening
+    image: ${IMAGE_PREFIX:-ghcr.io/example}/ebookstudio-analysis-worker:${IMAGE_TAG:-latest}
+    environment:
+      <<: *common-environment
+      WORKER_ROLE: analyze
+      WORKER_HEALTH_MAX_AGE_SECONDS: 120
+      HOME: /tmp
+    volumes:
+      - app-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/worker_healthcheck.py", "analyze"]
+      interval: 30s
+      timeout: 10s
+      retries: 4
+      start_period: 45s
+    stop_grace_period: 2m
+    mem_limit: ${ANALYSIS_MEMORY_LIMIT:-2g}
+
+  music-worker:
+    <<: *service-hardening
+    profiles: ["cpu-music"]
+    image: ${IMAGE_PREFIX:-ghcr.io/example}/ebookstudio-music-worker:${IMAGE_TAG:-latest}
+    environment:
+      <<: *common-environment
+      WORKER_ROLE: music_generation
+      WORKER_HEALTH_MAX_AGE_SECONDS: 180
+      MUSIC_GENERATOR_VERSION: ${MUSIC_GENERATOR_VERSION:-facebook/musicgen-small:v1}
+      HOME: /tmp
+      HF_HOME: /models/huggingface
+      TORCH_HOME: /models/torch
+    volumes:
+      - app-data:/data
+      - model-cache:/models
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/app/worker_healthcheck.py", "music_generation"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 2m
+    stop_grace_period: 2m
+    mem_limit: ${MUSIC_MEMORY_LIMIT:-16g}
+
+  music-worker-gpu:
+    <<: *service-hardening
+    profiles: ["gpu"]
+    image: ${IMAGE_PREFIX:-ghcr.io/example}/ebookstudio-music-worker-gpu:${IMAGE_TAG:-latest}
+    environment:
+      <<: *common-environment
+      WORKER_ROLE: music_generation
+      WORKER_HEALTH_MAX_AGE_SECONDS: 180
+      MUSIC_GENERATOR_VERSION: ${MUSIC_GENERATOR_VERSION:-facebook/musicgen-small:v1}
+      HOME: /tmp
+      HF_HOME: /models/huggingface
+      TORCH_HOME: /models/torch
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - app-data:/data
+      - model-cache:/models
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "/app/worker_healthcheck.py", "music_generation"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 3m
+    stop_grace_period: 2m
+    mem_limit: ${MUSIC_MEMORY_LIMIT:-16g}
+
+volumes:
+  app-data:
+  model-cache:
+
+networks:
+  backend:
+    driver: bridge
+
