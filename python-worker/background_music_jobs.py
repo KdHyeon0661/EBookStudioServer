@@ -40,7 +40,10 @@ _PROJECT_ROOT = os.path.dirname(_BASE_DIR)
 _STORAGE_ROOT = os.path.abspath(os.environ.get("EBOOK_STORAGE_ROOT", _PROJECT_ROOT))
 _DEFAULTS_DIR = os.path.join(_STORAGE_ROOT, "defaults")
 _MUSIC_DEFAULTS_DIR = os.path.join(_DEFAULTS_DIR, "music")
-_DEFAULT_DB_PATH = os.path.abspath(os.environ.get("EBOOK_DB_PATH", os.path.join(_PROJECT_ROOT, "users.db")))
+_DEFAULT_DB_PATH = os.path.abspath(os.environ.get(
+    "EBOOK_QUEUE_DB_PATH",
+    os.environ.get("EBOOK_DB_PATH", os.path.join(_PROJECT_ROOT, "jobs.db")),
+))
 
 _KEYWORDS_HISTORY_PATH = os.environ.get("KEYWORDS_HISTORY_PATH") or os.path.join(_DEFAULTS_DIR, "keywords_history.json")
 MAX_FILES_PER_FOLDER = 1000

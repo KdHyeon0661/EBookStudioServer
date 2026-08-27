@@ -1,7 +1,7 @@
 package com.ebookstudio.server.config;
 
-import org.springframework.boot.ApplicationArguments;
-import org.springframework.boot.ApplicationRunner;
+import jakarta.annotation.PostConstruct;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 
@@ -9,55 +9,19 @@ import java.util.HashSet;
 import java.util.Set;
 
 @Component
-public class DatabaseInitializer implements ApplicationRunner {
-    private final JdbcTemplate jdbc;
+public class DatabaseInitializer {
+    private final JdbcTemplate queueJdbc;
 
-    public DatabaseInitializer(JdbcTemplate jdbc) {
-        this.jdbc = jdbc;
+    public DatabaseInitializer(@Qualifier("queueJdbcTemplate") JdbcTemplate queueJdbc) {
+        this.queueJdbc = queueJdbc;
     }
 
-    @Override
-    public void run(ApplicationArguments args) {
-        jdbc.execute("PRAGMA journal_mode=WAL");
-        jdbc.execute("PRAGMA busy_timeout=10000");
-
-        jdbc.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    public_id TEXT NOT NULL UNIQUE,
-                    username TEXT NOT NULL UNIQUE,
-                    email TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    auth_version INTEGER NOT NULL DEFAULT 0
-                )
-                """);
-        jdbc.execute("""
-                CREATE TABLE IF NOT EXISTS token_blocklist (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    jti TEXT NOT NULL UNIQUE,
-                    created_at INTEGER NOT NULL,
-                    expires_at INTEGER
-                )
-                """);
-        jdbc.execute("""
-                CREATE TABLE IF NOT EXISTS verification_codes (
-                    email TEXT PRIMARY KEY,
-                    code TEXT NOT NULL,
-                    expires_at REAL NOT NULL,
-                    purpose TEXT NOT NULL DEFAULT 'register',
-                    last_sent_at INTEGER NOT NULL DEFAULT 0,
-                    failed_attempts INTEGER NOT NULL DEFAULT 0
-                )
-                """);
-        jdbc.execute("""
-                CREATE TABLE IF NOT EXISTS request_rate_limits (
-                    key_hash TEXT PRIMARY KEY,
-                    scope TEXT NOT NULL,
-                    window_started_at INTEGER NOT NULL,
-                    request_count INTEGER NOT NULL
-                )
-                """);
-        jdbc.execute("""
+    @PostConstruct
+    public void initialize() {
+        queueJdbc.execute("PRAGMA journal_mode=WAL");
+        queueJdbc.execute("PRAGMA busy_timeout=10000");
+        queueJdbc.execute("PRAGMA foreign_keys=ON");
+        queueJdbc.execute("""
                 CREATE TABLE IF NOT EXISTS worker_nodes (
                     id TEXT PRIMARY KEY,
                     job_type TEXT NOT NULL,
@@ -66,7 +30,7 @@ public class DatabaseInitializer implements ApplicationRunner {
                     heartbeat_at INTEGER NOT NULL
                 )
                 """);
-        jdbc.execute("""
+        queueJdbc.execute("""
                 CREATE TABLE IF NOT EXISTS music_prompt_cache (
                     signature TEXT PRIMARY KEY,
                     prompt TEXT NOT NULL,
@@ -88,21 +52,7 @@ public class DatabaseInitializer implements ApplicationRunner {
                     error TEXT
                 )
                 """);
-        jdbc.execute("""
-                CREATE TABLE IF NOT EXISTS usage_events (
-                    user_uuid TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    book_id TEXT,
-                    occurred_at INTEGER NOT NULL,
-                    duration_seconds INTEGER NOT NULL,
-                    page_turns INTEGER NOT NULL DEFAULT 0,
-                    progress_percent INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL,
-                    PRIMARY KEY(user_uuid, event_id)
-                )
-                """);
-        jdbc.execute("""
+        queueJdbc.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
                     type TEXT NOT NULL,
@@ -133,11 +83,6 @@ public class DatabaseInitializer implements ApplicationRunner {
                 )
                 """);
 
-        addMissingColumn("token_blocklist", "expires_at", "INTEGER");
-        addMissingColumn("users", "auth_version", "INTEGER NOT NULL DEFAULT 0");
-        addMissingColumn("verification_codes", "purpose", "TEXT NOT NULL DEFAULT 'register'");
-        addMissingColumn("verification_codes", "last_sent_at", "INTEGER NOT NULL DEFAULT 0");
-        addMissingColumn("verification_codes", "failed_attempts", "INTEGER NOT NULL DEFAULT 0");
         addMissingColumn("jobs", "output_json", "TEXT");
         addMissingColumn("jobs", "cover_file", "TEXT");
         addMissingColumn("jobs", "book_title", "TEXT");
@@ -151,35 +96,19 @@ public class DatabaseInitializer implements ApplicationRunner {
         addMissingColumn("jobs", "available_at", "INTEGER");
         addMissingColumn("jobs", "cancel_requested_at", "INTEGER");
 
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON request_rate_limits(window_started_at)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_music_prompt_cache_status_updated "
+        queueJdbc.execute("CREATE INDEX IF NOT EXISTS idx_music_prompt_cache_status_updated "
                 + "ON music_prompt_cache(status, updated_at)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_user_occurred "
-                + "ON usage_events(user_uuid, occurred_at)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_type_occurred "
-                + "ON usage_events(event_type, occurred_at)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_type_created ON jobs(status, type, created_at)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user_uuid ON jobs(user_uuid)");
-        jdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id ON jobs(parent_job_id)");
-        migrateLegacyUsers();
+        queueJdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_type_created "
+                + "ON jobs(status, type, created_at)");
+        queueJdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user_uuid ON jobs(user_uuid)");
+        queueJdbc.execute("CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id ON jobs(parent_job_id)");
     }
 
     private void addMissingColumn(String table, String name, String type) {
-        Set<String> columns = new HashSet<>(jdbc.query("PRAGMA table_info(" + table + ")",
+        Set<String> columns = new HashSet<>(queueJdbc.query("PRAGMA table_info(" + table + ")",
                 (rs, rowNum) -> rs.getString("name")));
         if (!columns.contains(name)) {
-            jdbc.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " " + type);
-        }
-    }
-
-    private void migrateLegacyUsers() {
-        Integer legacyExists = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user'", Integer.class);
-        if (legacyExists != null && legacyExists > 0) {
-            jdbc.update("""
-                    INSERT OR IGNORE INTO users(public_id, username, email, password_hash)
-                    SELECT public_id, username, email, password_hash FROM user
-                    """);
+            queueJdbc.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " " + type);
         }
     }
 }

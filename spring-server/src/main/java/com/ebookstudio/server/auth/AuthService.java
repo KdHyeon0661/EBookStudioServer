@@ -61,12 +61,27 @@ public class AuthService {
 
         String code = String.valueOf(100000 + RANDOM.nextInt(900000));
         long expiresAt = now + properties.verificationCodeSeconds();
-        jdbc.update("""
-                INSERT INTO verification_codes(email, code, expires_at, purpose, last_sent_at, failed_attempts)
-                VALUES (?, ?, ?, ?, ?, 0)
-                ON CONFLICT(email) DO UPDATE SET code=excluded.code, expires_at=excluded.expires_at,
-                    purpose=excluded.purpose, last_sent_at=excluded.last_sent_at, failed_attempts=0
-                """, email, hashVerificationCode(email, purpose, code), expiresAt, purpose, now);
+        String codeHash = hashVerificationCode(email, purpose, code);
+        int updated = jdbc.update("""
+                UPDATE verification_codes
+                SET code=?, expires_at=?, purpose=?, last_sent_at=?, failed_attempts=0
+                WHERE email=?
+                """, codeHash, expiresAt, purpose, now, email);
+        if (updated == 0) {
+            try {
+                jdbc.update("""
+                        INSERT INTO verification_codes(
+                            email, code, expires_at, purpose, last_sent_at, failed_attempts)
+                        VALUES (?, ?, ?, ?, ?, 0)
+                        """, email, codeHash, expiresAt, purpose, now);
+            } catch (DuplicateKeyException concurrentInsert) {
+                jdbc.update("""
+                        UPDATE verification_codes
+                        SET code=?, expires_at=?, purpose=?, last_sent_at=?, failed_attempts=0
+                        WHERE email=?
+                        """, codeHash, expiresAt, purpose, now, email);
+            }
+        }
         mailService.send(email, code, purpose);
         String developmentCode = properties.emailExposeDevelopmentCode() && !properties.emailDeliveryEnabled()
                 ? code : null;
@@ -218,8 +233,12 @@ public class AuthService {
     private void block(Claims claims) {
         long expiration = claims.getExpiration() == null ? Instant.now().getEpochSecond()
                 : claims.getExpiration().toInstant().getEpochSecond();
-        jdbc.update("INSERT OR IGNORE INTO token_blocklist(jti, created_at, expires_at) VALUES (?, ?, ?)",
-                claims.getId(), Instant.now().getEpochSecond(), expiration);
+        try {
+            jdbc.update("INSERT INTO token_blocklist(jti, created_at, expires_at) VALUES (?, ?, ?)",
+                    claims.getId(), Instant.now().getEpochSecond(), expiration);
+        } catch (DuplicateKeyException alreadyBlocked) {
+            // Idempotent logout/refresh invalidation.
+        }
     }
 
     private void cleanupBlocklist() {

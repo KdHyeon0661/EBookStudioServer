@@ -1,18 +1,32 @@
 # EBookStudio Spring Server
 
-인증, 사용자/도서 소유권, PDF 업로드, 작업 상태, 파일 제공을 담당합니다.
+인증, 사용자·책 영속 데이터, PDF 업로드, Job 상태, 파일 제공과 사용량 집계를 담당합니다.
 무거운 PDF 및 음악 처리는 형제 폴더 `../python-worker/`의 Worker가 수행합니다.
-전체 구성과 운영 경계는 상위 폴더의 `ARCHITECTURE.md`를 참고하십시오.
+
+## 데이터 저장
+
+- PostgreSQL: `users`, 인증 관련 테이블, `books`, `usage_events`
+- SQLite `/data/jobs.db`: `jobs`, `worker_nodes`, `music_prompt_cache`
+- 파일 저장소: PDF, 표지, 분석 JSON, 공용 음악
+
+Spring의 기본 `JdbcTemplate`은 PostgreSQL을 사용하고 `queueJdbcTemplate`만 SQLite를
+사용합니다. PostgreSQL 스키마는 `src/main/resources/db/migration`의 Flyway migration으로
+관리합니다. MyBatis와 JPA는 사용하지 않습니다.
 
 ## 실행
 
+로컬에서는 PostgreSQL을 먼저 실행하고 다음 값을 설정합니다.
+
 ```powershell
+$env:SPRING_DATASOURCE_URL='jdbc:postgresql://localhost:5432/ebookstudio'
+$env:SPRING_DATASOURCE_USERNAME='ebookstudio'
+$env:SPRING_DATASOURCE_PASSWORD='ebookstudio-local'
+$env:EBOOK_QUEUE_DB_PATH='C:\ebookstudio\data\jobs.db'
 .\mvnw.cmd spring-boot:run
 ```
 
-기본 포트는 5000입니다. 환경 변수 전체 예시는 상위 폴더의 `.env.example`과
-`README.md`를 참고하십시오. 컨테이너 실행은 상위 폴더에서 `docker compose up --build -d`,
-음악 생성은 `--profile cpu-music` 또는 `--profile gpu` 중 하나를 추가합니다.
+가장 간단한 실행 방법은 상위 폴더에서 `docker compose up --build -d`를 사용하는 것입니다.
+기본 포트는 5000입니다.
 
 ## 주요 API
 
@@ -22,12 +36,5 @@
 - 파일: `/list_music_files/...`, `/files/...`
 - 사용량: `POST /usage/events`, `GET /usage/summary`
 
-`/find_id`와 `/reset_password`는 복구용 이메일 인증번호가 필요합니다.
-업로드 완료 응답은 `music_job_id`를 포함할 수 있으며, 클라이언트는 해당 작업이
-완료되면 JSON과 음악 파일을 다시 동기화해야 합니다.
-
-Spring과 Python 워커는 같은 SQLite의 `music_prompt_cache`를 사용합니다. Spring은
-테이블을 초기화하고, 워커는 프롬프트 서명별 생성·완료·재사용·실패 상태를 기록합니다.
-
-사용량 이벤트는 인증된 본인 계정에만 기록되며 `(user_uuid, event_id)`로 중복을
-제거합니다. 서버는 콘텐츠나 메모를 받지 않고 집계에 필요한 최소 필드만 저장합니다.
+업로드 시 PostgreSQL에 책 처리 상태를 만들고 SQLite에 분석 Job을 등록합니다. 분석 완료
+결과는 Job 조회 또는 내 서재 조회 시 PostgreSQL 책 카탈로그에 멱등 반영됩니다.

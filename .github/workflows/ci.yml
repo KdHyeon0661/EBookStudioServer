@@ -52,6 +52,8 @@ jobs:
         run: python -m pytest -q
       - name: Compile all Worker modules
         run: python -m compileall -q .
+      - name: Test legacy database migration safety
+        run: python -m unittest discover -s ../scripts/tests -v
 
   compose-validate:
     name: Docker Compose validation
@@ -64,6 +66,9 @@ jobs:
           docker compose --profile cpu-music config --quiet
           docker compose --profile gpu config --quiet
       - name: Validate image-deployment Compose profiles
+        env:
+          POSTGRES_PASSWORD: ci-database-password
+          SECRET_KEY: ci-only-secret-key-with-more-than-sixty-four-characters-000000000000
         run: |
           docker compose --env-file .env.docker.example -f compose.deploy.yaml config --quiet
           docker compose --env-file .env.docker.example -f compose.deploy.yaml --profile cpu-music config --quiet
@@ -82,7 +87,9 @@ jobs:
             cache_scope: spring-api
           - name: Analysis Worker
             context: python-worker
-            build_args: REQUIREMENTS_FILE=requirements-analyzer.txt
+            build_args: |
+              REQUIREMENTS_FILE=requirements-analyzer.txt
+              INSTALL_AUDIO_TOOLS=false
             cache_scope: analysis-worker
     steps:
       - uses: actions/checkout@v4

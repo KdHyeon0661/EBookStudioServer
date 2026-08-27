@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing
 import os
+import signal
 import shutil
 import sqlite3
 import threading
@@ -16,13 +17,21 @@ from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-DB_PATH = Path(os.environ.get("EBOOK_DB_PATH", PROJECT_ROOT / "users.db")).resolve()
+DB_PATH = Path(os.environ.get(
+    "EBOOK_QUEUE_DB_PATH", os.environ.get("EBOOK_DB_PATH", PROJECT_ROOT / "jobs.db")
+)).resolve()
 STORAGE_ROOT = Path(os.environ.get("EBOOK_STORAGE_ROOT", PROJECT_ROOT)).resolve()
 DEFAULT_MUSIC_FOLDER = STORAGE_ROOT / "defaults" / "music"
 BUNDLED_DEFAULTS = BASE_DIR / "defaults"
 STALE_JOB_SECONDS = int(os.environ.get("JOB_STALE_SECONDS", "900"))
 HEARTBEAT_SECONDS = max(5, int(os.environ.get("JOB_HEARTBEAT_SECONDS", "30")))
 MAX_ATTEMPTS = max(1, int(os.environ.get("JOB_MAX_ATTEMPTS", "3")))
+SHUTDOWN_EVENT = threading.Event()
+
+
+def request_shutdown(_signal_number: int, _frame: object) -> None:
+    """Finish an active job, or wake an idle PID 1 worker for prompt shutdown."""
+    SHUTDOWN_EVENT.set()
 
 
 def connect() -> sqlite3.Connection:
@@ -505,10 +514,13 @@ def update_worker_node(worker_id: str, job_type: str) -> None:
 
 
 def run_loop(job_type: str, idle_seconds: float) -> None:
+    SHUTDOWN_EVENT.clear()
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
     worker_id = f"{job_type}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     print(f"[SpringWorker:{job_type}] started id={worker_id} db={DB_PATH}")
     last_recovery = 0.0
-    while True:
+    while not SHUTDOWN_EVENT.is_set():
         job = None
         try:
             update_worker_node(worker_id, job_type)
@@ -517,7 +529,7 @@ def run_loop(job_type: str, idle_seconds: float) -> None:
                 last_recovery = time.monotonic()
             job = claim_job(job_type, worker_id)
             if job is None:
-                time.sleep(idle_seconds)
+                SHUTDOWN_EVENT.wait(idle_seconds)
                 continue
             with JobHeartbeat(job["id"], worker_id):
                 if job_type == "analyze":
@@ -534,7 +546,7 @@ def run_loop(job_type: str, idle_seconds: float) -> None:
             traceback.print_exc()
             if job is not None:
                 fail_job(job, worker_id, error)
-            time.sleep(2)
+            SHUTDOWN_EVENT.wait(2)
 
 
 def main() -> None:

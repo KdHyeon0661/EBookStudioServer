@@ -3,7 +3,7 @@
 EBookStudio의 유일한 API 진입점은 `spring-server/`의 Spring Boot 서버입니다.
 Python은 `python-worker/spring_worker.py`를 통해 PDF 분석과 MusicGen 추론만 담당하며 HTTP API를
 제공하지 않습니다. 구성 요소의 책임, 장애 복구와 확장 기준은
-[ARCHITECTURE.md](ARCHITECTURE.md)에 정리되어 있습니다.
+[ARCHITECTURE.md](ARCHITECTURE.md)에 정리되어 있습니다. 현재 PK·FK·JOIN과 API별 데이터 사용처는 [DATABASE.md](DATABASE.md), 설치·이전·백업은 [DEPLOYMENT.md](DEPLOYMENT.md)를 기준으로 합니다.
 
 ## 저장소 구조
 
@@ -11,9 +11,13 @@ Python은 `python-worker/spring_worker.py`를 통해 PDF 분석과 MusicGen 추�
 EBookStudioServer-master/
 ├─ spring-server/       # Spring Boot API와 업무 규칙
 ├─ python-worker/       # PDF 분석과 MusicGen 작업 처리
-├─ compose.yaml         # API와 Worker 통합 실행
+├─ compose.yaml         # 소스 빌드용 로컬 구성
+├─ compose.deploy.yaml  # GHCR 이미지 운영 배포 구성
+├─ scripts/             # 준비 확인 실행·기존 DB 이전 도구
 ├─ README.md
-└─ ARCHITECTURE.md
+├─ ARCHITECTURE.md
+├─ DATABASE.md
+└─ DEPLOYMENT.md
 ```
 
 두 실행 모듈은 프레임워크 이름이 아니라 배포 역할로 구분합니다. Python 구성 요소는
@@ -28,6 +32,10 @@ HTTP API를 제공하는 Flask 서버가 아니므로 `flask-server`가 아닌 `
 4. 사용자는 포함된 `default_ambient.wav` 또는 기존 음악으로 즉시 읽을 수 있습니다.
 5. MusicGen 워커가 세그먼트별 음악을 생성하고 현재 책 JSON을 원자적으로 갱신합니다.
 6. WPF는 `music_job_id`를 추적해 갱신된 JSON과 음악을 다시 내려받습니다.
+
+사용자·인증·책·사용량뿐 아니라 처리 이력·산출물·공용 음악 자산·책별 음악 매핑은 PostgreSQL에 영속 저장합니다. Spring과 Python이 함께 읽는
+SQLite `jobs.db`에는 Job, Worker heartbeat와 음악 프롬프트 캐시만 둡니다. PostgreSQL
+스키마는 Flyway로 관리하고, Job 결과는 Spring이 책 카탈로그에 멱등 projection합니다.
 
 작업은 heartbeat, 제한 재시도, 지수 backoff와 결정적 하위 작업 ID를 사용합니다.
 오래된 `running` 작업만 복구하므로 정상 워커의 작업을 다시 가져가지 않습니다.
@@ -51,11 +59,26 @@ WPF 사용량은 오프라인 우선 outbox를 통해 `POST /usage/events`로 �
 집계합니다. 책 원문, 메모, 하이라이트와 페이지별 열람 이력은 수집하지 않습니다.
 회원 탈퇴 시 이 집계 데이터도 같은 트랜잭션에서 삭제됩니다.
 
+## 화면과 API 연결
+
+| WPF 화면/동작 | Spring API | 핵심 데이터 |
+|---|---|---|
+| 로그인·계정 관리 | `/login`, `/refresh`, `/change_password`, `/account` | 사용자, 폐기 토큰, 인증 보조 데이터 |
+| 서재 업로드·작업 추적 | `/upload_book`, `/check_status/{jobId}`, `/jobs/{jobId}` | 책 카탈로그, 처리 실행, SQLite Job |
+| 책 상세 | `/api/books/{bookFolder}/processing-history`, `/music-tracks` | 처리 이력·산출물·세그먼트별 음악과 재사용 횟수 |
+| 마이페이지 | `/usage/summary`, `/usage/books`, `/usage/daily` | 전체·책별·최근 7일 사용량 집계 |
+| 오프라인 활동 동기화 | `POST /usage/events` | 이벤트 UUID 기반 멱등 사용량 저장 |
+
+이 API들은 단순히 테이블을 만들기 위한 예제가 아니라 WPF의 책 상세와 마이페이지에서
+실제로 호출됩니다. 자세한 테이블 관계와 FK를 두지 않은 필드의 이유는
+[DATABASE.md](DATABASE.md)에 기록했습니다.
+
 ## 요구 사항
 
 - Java 17 이상
 - Python 3.11 또는 3.12 권장
 - .NET 9 Windows SDK
+- PostgreSQL 15 이상 또는 Docker
 - MusicGen 실행용 GPU 권장
 
 현재 시스템 Python이 3.14라면 별도의 3.12 가상환경을 사용하십시오.
@@ -80,20 +103,18 @@ pip install -r requirements-worker-cu130.txt
 
 ## 로컬 실행
 
-두 프로세스가 같은 `EBOOK_DB_PATH`와 `EBOOK_STORAGE_ROOT`를 사용해야 합니다.
-기본값은 저장소 루트의 `users.db`, `users/`, `defaults/`입니다.
+Spring은 PostgreSQL 접속 정보가 필요하고, Spring과 Python Worker는 같은
+`EBOOK_QUEUE_DB_PATH`와 `EBOOK_STORAGE_ROOT`를 사용해야 합니다. 기본 queue 파일은
+저장소 루트의 `jobs.db`입니다. 로컬 전체 실행은 Docker Compose를 권장합니다.
 
 ```powershell
-cd spring-server
-.\mvnw.cmd spring-boot:run
+Copy-Item .env.example .env
+docker compose --env-file .env up --build -d
 ```
 
-다른 터미널에서 저장소 루트를 기준으로:
-
-`powershell
-cd python-worker
-python spring_worker.py
-```
+직접 실행할 때는 PostgreSQL을 먼저 준비하고 `SPRING_DATASOURCE_URL`,
+`SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`를 설정한 뒤 Spring과 Worker를
+각각 실행합니다.
 
 워커 하나만 직접 실행할 때는 역할을 지정할 수 있습니다.
 
@@ -111,7 +132,7 @@ GitHub Release를 발행하면 GHCR 배포 이미지도 생성됩니다. 기존 
 
 WPF는 Windows 네이티브 오프라인 클라이언트이므로 컨테이너 대상이 아니며,
 Spring API와 Python 워커만 Docker로 실행합니다. 기본 구성은 API와 가벼운 PDF
-분석 워커를 실행합니다.
+분석 워커를 실행합니다. 분석 이미지는 오디오/FFmpeg 패키지를 설치하지 않고, 해당 패키지는 MusicGen 이미지에만 포함합니다.
 
 `.env.example`은 인증번호를 보내지도 응답에 노출하지도 않는 안전한 기본값입니다.
 로컬에서 계정 흐름을 시연할 때만 복사한 `.env`의
@@ -135,20 +156,20 @@ docker compose --profile cpu-music up --build -d
 docker compose --profile gpu up --build -d
 ```
 
-`data-init`은 named volume의 소유권을 1회 맞춘 뒤 종료합니다. 이후 API와 워커는
+`data-init`은 named volume의 소유권을 1회 맞춘 뒤 종료합니다. 이후 API와 Worker는
 UID 10001, read-only root filesystem, capability 제거, `no-new-privileges` 상태로
-실행됩니다. `/data`에는 SQLite와 사용자 산출물, `/models`에는 Hugging Face/PyTorch
-모델 캐시가 유지됩니다. 상태 확인은 API `/health`와 각 워커의 SQLite heartbeat를
-사용하며 로그는 컨테이너별 10MB × 3개로 회전합니다.
+실행됩니다. PostgreSQL은 `postgres-data`, `/data/jobs.db`와 사용자 산출물은 `app-data`,
+모델 캐시는 `model-cache`에 유지됩니다. `/health`는 PostgreSQL 연결, queue 적체와 Worker
+heartbeat를 함께 보여주며 로그는 컨테이너별 10MB × 3개로 회전합니다.
 
 ```powershell
 docker compose logs -f api analysis-worker
 docker compose down
 ```
 
-`docker compose down`은 named volume을 보존하지만 `docker compose down -v`는 DB,
-책과 모델 캐시를 삭제하므로 운영 데이터가 있을 때 사용하면 안 됩니다. 백업은 쓰기를
-멈춘 뒤 volume 전체를 보관하는 방식이 가장 단순합니다.
+`docker compose down`은 named volume을 보존하지만 `docker compose down -v`는
+PostgreSQL, Job, 책과 모델 캐시를 모두 삭제하므로 운영 데이터가 있을 때 사용하면 안
+됩니다. PostgreSQL dump와 `app-data` volume을 함께 백업해야 합니다.
 
 ```powershell
 docker compose stop api analysis-worker music-worker music-worker-gpu
@@ -158,12 +179,11 @@ docker run --rm -v ebookstudio_app-data:/data:ro -v "${PWD}/backups:/backup" `
 docker compose start api analysis-worker
 ```
 
-현재 SQLite 큐는 단일 Docker 호스트와 로컬 named volume을 전제로 합니다. API를 여러
-인스턴스로 수평 확장하거나 여러 서버가 네트워크 파일시스템의 같은 DB를 공유하는
-구성은 지원하지 않습니다. 그 단계에서 PostgreSQL을 영속 DB로, RabbitMQ 같은
-브로커를 작업 전달 계층으로, S3 호환 저장소를 산출물 계층으로 분리하는 것이 전환
-기준입니다. 현재 개인 프로젝트 규모에서는 이 구성이 운영 복잡도보다 명확한 이점을
-줍니다.
+PostgreSQL 서비스 DB와 SQLite Job 큐는 이미 물리적으로 분리되어 있습니다. 현재 SQLite
+queue는 단일 Docker 호스트와 로컬 named volume을 전제로 하며 여러 호스트에서 공유하지
+않습니다. API·Worker의 다중 호스트 확장, 우선순위나 dead-letter 운영이 필요해지면
+RabbitMQ 같은 브로커로 교체하고, 산출물이 단일 호스트 범위를 넘으면 S3 호환 저장소로
+옮기는 것이 전환 기준입니다.
 
 SMTP 없이 UI를 로컬 시연할 때만 Spring 실행 전에 아래 값을 설정하면 인증번호가
 API 응답으로 전달됩니다. 운영 환경에서는 절대 활성화하지 마십시오.
@@ -206,4 +226,4 @@ Spring 테스트는 회원가입, 로그인, 업로드 큐 등록, 비밀번호 
 계정 복구와 회원 탈퇴뿐 아니라 인증번호 HMAC 저장, 요청 제한, 안전한 파일 삭제,
 사용량 배치 멱등성과 계정 삭제 연동을 실제 HTTP로 검증합니다. Python 테스트는 작업 선점,
 heartbeat 복구, 재시도, 프롬프트 카탈로그 중복 방지, 파일 유실 감지와
-책 JSON 음악 교체를 검증합니다.
+책 JSON 음악 교체를 검증합니다. 서비스 흐름 테스트에는 처리 이력·음악 상세·책별 및 일별 사용량 API의 인증과 소유권 검사도 포함됩니다. `scripts/tests`는 기존 통합 SQLite를 분리할 때 PostgreSQL 소유 테이블이 새 queue DB에 남지 않고 기존 출력 파일을 덮어쓰지 않는지 검증합니다.

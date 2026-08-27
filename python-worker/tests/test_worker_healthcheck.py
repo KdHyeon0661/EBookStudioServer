@@ -16,7 +16,7 @@ def create_database(path):
 
 
 def run_check(monkeypatch, db_path, role="analyze", maximum_age=120):
-    monkeypatch.setenv("EBOOK_DB_PATH", str(db_path))
+    monkeypatch.setenv("EBOOK_QUEUE_DB_PATH", str(db_path))
     monkeypatch.setenv("WORKER_HEALTH_MAX_AGE_SECONDS", str(maximum_age))
     monkeypatch.setattr(sys, "argv", ["worker_healthcheck.py", role])
     return worker_healthcheck.main()

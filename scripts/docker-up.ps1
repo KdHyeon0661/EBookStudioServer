@@ -28,7 +28,8 @@ if (-not (Test-Path -LiteralPath $envFile)) {
     Write-Host '.env를 생성하고 SECRET_KEY를 무작위 값으로 설정했습니다.'
 }
 
-$arguments = @('compose', '--env-file', $envFile)
+$composeFile = Join-Path $repo 'compose.yaml'
+$arguments = @('compose', '--project-directory', $repo, '--env-file', $envFile, '-f', $composeFile)
 if ($MusicProfile -ne 'none') {
     $arguments += @('--profile', $MusicProfile)
 }
@@ -36,9 +37,17 @@ if ($MusicProfile -ne 'none') {
 & docker @arguments config --quiet
 if ($LASTEXITCODE -ne 0) { throw 'Docker Compose 설정 검증에 실패했습니다.' }
 
-& docker @arguments up --build --detach
-if ($LASTEXITCODE -ne 0) { throw 'EBookStudio 컨테이너 시작에 실패했습니다.' }
+& docker @arguments up --build --detach --wait --wait-timeout 300
+if ($LASTEXITCODE -ne 0) { throw 'EBookStudio 컨테이너 시작 또는 준비 확인에 실패했습니다.' }
 
 & docker @arguments ps
-Write-Host 'API health: http://127.0.0.1:5000/health'
+$apiPort = 5000
+$portMatch = [regex]::Match((Get-Content -Raw -LiteralPath $envFile), '(?m)^API_PORT=(\d+)\s*$')
+if ($portMatch.Success) { $apiPort = [int]$portMatch.Groups[1].Value }
+$healthUrl = "http://127.0.0.1:$apiPort/health"
+$health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 10
+if ($health.status -ne 'ok' -or $health.persistence -ne 'postgresql') {
+    throw 'API health 응답이 예상한 PostgreSQL 구성과 다릅니다.'
+}
+Write-Host "EBookStudio가 준비되었습니다: $healthUrl"
 

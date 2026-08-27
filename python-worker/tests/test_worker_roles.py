@@ -1,3 +1,4 @@
+import signal
 import sys
 
 import pytest
@@ -39,6 +40,13 @@ def test_command_line_role_overrides_environment(monkeypatch):
     spring_worker.main()
 
     assert calls == [("analyze", 1.0)]
+
+
+def test_shutdown_signal_sets_worker_stop_event():
+    spring_worker.SHUTDOWN_EVENT.clear()
+    spring_worker.request_shutdown(signal.SIGTERM, None)
+    assert spring_worker.SHUTDOWN_EVENT.is_set()
+    spring_worker.SHUTDOWN_EVENT.clear()
 
 
 def test_invalid_environment_role_fails_before_initialization(monkeypatch):

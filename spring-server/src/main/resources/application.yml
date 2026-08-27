@@ -5,11 +5,14 @@ spring:
   application:
     name: ebookstudio-server
   datasource:
-    url: jdbc:sqlite:${EBOOK_DB_PATH:../users.db}
-    driver-class-name: org.sqlite.JDBC
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ebookstudio}
+    username: ${SPRING_DATASOURCE_USERNAME:ebookstudio}
+    password: ${SPRING_DATASOURCE_PASSWORD:ebookstudio}
+    driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: 4
-      connection-init-sql: PRAGMA foreign_keys=ON
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+  flyway:
+    enabled: true
   servlet:
     multipart:
       max-file-size: 100MB
@@ -25,6 +28,7 @@ spring:
 
 ebookstudio:
   storage-root: ${EBOOK_STORAGE_ROOT:..}
+  queue-db-path: ${EBOOK_QUEUE_DB_PATH:../jobs.db}
   jwt-secret: ${SECRET_KEY:}
   access-token-seconds: ${ACCESS_TOKEN_SECONDS:3600}
   refresh-token-seconds: ${REFRESH_TOKEN_SECONDS:604800}

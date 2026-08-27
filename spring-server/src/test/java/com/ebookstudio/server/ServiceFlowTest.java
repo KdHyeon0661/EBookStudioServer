@@ -2,6 +2,7 @@ package com.ebookstudio.server;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpStatus;
@@ -34,13 +35,22 @@ class ServiceFlowTest {
     ObjectMapper mapper;
 
     @Autowired
-    JdbcTemplate jdbc;
+    JdbcTemplate appJdbc;
+
+    @Autowired
+    @Qualifier("queueJdbcTemplate")
+    JdbcTemplate queueJdbc;
 
     private final HttpClient http = HttpClient.newHttpClient();
 
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        registry.add("spring.datasource.url", () -> "jdbc:sqlite:" + ROOT.resolve("test.db"));
+        registry.add("spring.datasource.url", () ->
+                "jdbc:h2:mem:ebookstudio;MODE=PostgreSQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE");
+        registry.add("spring.datasource.driver-class-name", () -> "org.h2.Driver");
+        registry.add("spring.datasource.username", () -> "sa");
+        registry.add("spring.datasource.password", () -> "");
+        registry.add("ebookstudio.queue-db-path", () -> ROOT.resolve("jobs.db").toString());
         registry.add("ebookstudio.storage-root", () -> ROOT.resolve("storage").toString());
         registry.add("ebookstudio.jwt-secret", () -> "integration-test-secret");
         registry.add("ebookstudio.email-delivery-enabled", () -> "false");
@@ -59,12 +69,10 @@ class ServiceFlowTest {
         ApiResponse health = json("GET", "/health", null, null);
         assertThat(health.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(health.body().get("database")).isEqualTo("ok");
-        assertThat(jdbc.queryForObject(
+        assertThat(queueJdbc.queryForObject(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='music_prompt_cache'",
                 Integer.class)).isEqualTo(1);
-        assertThat(jdbc.queryForObject(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_events'",
-                Integer.class)).isEqualTo(1);
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM usage_events", Integer.class)).isZero();
 
         String email = "flow@example.com";
         String username = "flow-user";
@@ -101,6 +109,23 @@ class ServiceFlowTest {
         assertThat(usageSummary.body().get("reading_session_count")).isEqualTo(1);
         assertThat(usageSummary.body().get("page_turn_count")).isEqualTo(4);
         assertThat(usageSummary.body().get("books_read_count")).isEqualTo(1);
+        ApiResponse usageBooks = json("GET", "/usage/books", null, access);
+        assertThat(usageBooks.status()).isEqualTo(HttpStatus.OK.value());
+        List<?> bookUsageItems = (List<?>) usageBooks.body().get("books");
+        assertThat(bookUsageItems).hasSize(1);
+        Map<?, ?> bookUsage = (Map<?, ?>) bookUsageItems.get(0);
+        assertThat(bookUsage.get("book_id")).isEqualTo("offline-book-1");
+        assertThat(bookUsage.get("total_reading_seconds")).isEqualTo(120);
+        assertThat(bookUsage.get("highest_progress_percent")).isEqualTo(35);
+        ApiResponse dailyUsage = json("GET", "/usage/daily?days=7", null, access);
+        assertThat(dailyUsage.status()).isEqualTo(HttpStatus.OK.value());
+        assertThat(dailyUsage.body().get("window_days")).isEqualTo(7);
+        assertThat(dailyUsage.body().get("timezone")).isEqualTo("UTC");
+        List<?> dailyItems = (List<?>) dailyUsage.body().get("daily");
+        assertThat(dailyItems).hasSize(7).anySatisfy(item ->
+                assertThat(((Map<?, ?>) item).get("reading_seconds")).isEqualTo(120));
+        assertThat(json("GET", "/usage/daily?days=0", null, access).status())
+                .isEqualTo(HttpStatus.BAD_REQUEST.value());
 
         String uploadRequestId = java.util.UUID.randomUUID().toString();
         ApiResponse accepted = upload(access, uploadRequestId);
@@ -108,9 +133,33 @@ class ServiceFlowTest {
         ApiResponse duplicateAccepted = upload(access, uploadRequestId);
         assertThat(duplicateAccepted.body().get("job_id")).isEqualTo(accepted.body().get("job_id"));
         assertThat(duplicateAccepted.body().get("book_folder")).isEqualTo(accepted.body().get("book_folder"));
-        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM jobs WHERE id=?", Integer.class,
+        assertThat(queueJdbc.queryForObject("SELECT COUNT(*) FROM jobs WHERE id=?", Integer.class,
                 uploadRequestId)).isEqualTo(1);
+        String bookFolder = (String) accepted.body().get("book_folder");
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM books WHERE owner_public_id=? AND folder=?", Integer.class,
+                publicId, bookFolder)).isEqualTo(1);
+        Long uploadedBookId = appJdbc.queryForObject(
+                "SELECT id FROM books WHERE owner_public_id=? AND folder=?", Long.class,
+                publicId, bookFolder);
         String jobId = (String) accepted.body().get("job_id");
+        Long uploadedRunId = appJdbc.queryForObject(
+                "SELECT id FROM processing_runs WHERE book_id=?", Long.class, uploadedBookId);
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM processing_runs WHERE id=?", String.class, uploadedRunId))
+                .isEqualTo("QUEUED");
+        assertThat(appJdbc.queryForObject(
+                "SELECT request_id FROM processing_runs WHERE id=?", String.class, uploadedRunId))
+                .isEqualTo(jobId);
+        assertThat(appJdbc.queryForObject(
+                "SELECT queue_job_id FROM processing_runs WHERE id=?", String.class, uploadedRunId))
+                .isEqualTo(jobId);
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM book_artifacts WHERE processing_run_id=? AND artifact_type='SOURCE_PDF'",
+                Integer.class, uploadedRunId)).isEqualTo(1);
+        assertThat(appJdbc.queryForObject(
+                "SELECT LENGTH(checksum) FROM book_artifacts WHERE processing_run_id=?",
+                Integer.class, uploadedRunId)).isEqualTo(64);
         ApiResponse status = json("GET", "/check_status/" + jobId, null, access);
         assertThat(status.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(status.body().get("status")).isEqualTo("queued");
@@ -121,17 +170,235 @@ class ServiceFlowTest {
         assertThat(cancelled.body().get("status")).isEqualTo("cancelled");
         assertThat(json("DELETE", "/jobs/" + jobId, null, access).body().get("status"))
                 .isEqualTo("cancelled");
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM processing_runs WHERE id=?", String.class, uploadedRunId))
+                .isEqualTo("CANCELLED");
 
         ApiResponse runningAccepted = upload(access);
         String runningJobId = (String) runningAccepted.body().get("job_id");
-        jdbc.update("UPDATE jobs SET status='running', worker_id='test-worker', started_at=? WHERE id=?",
-                System.currentTimeMillis() / 1000, runningJobId);
+        queueJdbc.update("""
+                UPDATE jobs SET status='running', worker_id='test-worker',
+                                started_at=?, attempt_count=1 WHERE id=?
+                """, System.currentTimeMillis() / 1000, runningJobId);
         ApiResponse requested = json("DELETE", "/jobs/" + runningJobId, null, access);
         assertThat(requested.body().get("status")).isEqualTo("cancel_requested");
-        jdbc.update("UPDATE jobs SET status='cancelled', finished_at=?, worker_id=NULL WHERE id=?",
+        assertThat(appJdbc.queryForObject("""
+                SELECT r.status FROM processing_runs r JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=?
+                """, String.class, runningJobId)).isEqualTo("CANCEL_REQUESTED");
+        queueJdbc.update("UPDATE jobs SET status='cancelled', finished_at=?, worker_id=NULL WHERE id=?",
                 System.currentTimeMillis() / 1000, runningJobId);
+        assertThat(json("GET", "/check_status/" + runningJobId, null, access).body().get("status"))
+                .isEqualTo("cancelled");
+        assertThat(appJdbc.queryForObject("""
+                SELECT r.status FROM processing_runs r JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=?
+                """, String.class, runningJobId)).isEqualTo("CANCELLED");
 
-        String bookFolder = (String) accepted.body().get("book_folder");
+        ApiResponse completedAccepted = upload(access);
+        String completedJobId = (String) completedAccepted.body().get("job_id");
+        String completedFolder = (String) completedAccepted.body().get("book_folder");
+        Path completedRoot = ROOT.resolve("storage").resolve("users")
+                .resolve(publicId).resolve(completedFolder);
+        Files.writeString(completedRoot.resolve("completed_full.json"),
+                "{\"book_info\":{\"title\":\"Completed Book\"},"
+                        + "\"chapters\":[{\"segments\":[{"
+                        + "\"music_filename\":\"default_ambient.wav\","
+                        + "\"music_source\":\"system_default\",\"bpm\":80,"
+                        + "\"generation_hint\":{\"target_emotion\":\"calm\"}}]}]}");
+        Files.write(completedRoot.resolve("cover.png"), new byte[]{
+                (byte) 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a});
+        Path defaultsRoot = ROOT.resolve("storage").resolve("defaults");
+        Files.createDirectories(defaultsRoot);
+        Files.writeString(defaultsRoot.resolve("music_index.json"), "{}");
+        long completedAt = System.currentTimeMillis() / 1000;
+        String musicJobId = java.util.UUID.randomUUID().toString();
+        queueJdbc.update("""
+                INSERT INTO jobs(id, type, user_uuid, book_id, status, created_at,
+                                 json_path, music_folder, web_path_prefix,
+                                 parent_job_id, max_attempts)
+                VALUES (?, 'music_generation', ?, ?, 'queued', ?, ?, ?, ?, ?, 3)
+                """, musicJobId, publicId, completedFolder, completedAt,
+                completedRoot.resolve("completed_full.json").toString(),
+                defaultsRoot.resolve("music").toString(),
+                "/files/" + username + "/" + completedFolder, completedJobId);
+        queueJdbc.update("""
+                UPDATE jobs SET status='done', started_at=?, finished_at=?, attempt_count=1,
+                                output_json='completed_full.json', cover_file='cover.png',
+                                book_title='Completed Book', author='Test Author', music_job_id=?
+                WHERE id=?
+                """, completedAt - 1, completedAt, musicJobId, completedJobId);
+        assertThat(json("GET", "/check_status/" + completedJobId, null, access).body().get("status"))
+                .isEqualTo("done");
+        assertThat(appJdbc.queryForObject("""
+                SELECT r.status FROM processing_runs r JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=? AND r.process_type='ANALYZE'
+                """, String.class, completedJobId)).isEqualTo("SUCCEEDED");
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM books WHERE job_id=?", String.class, completedJobId))
+                .isEqualTo("READY");
+        Long completedRunId = appJdbc.queryForObject("""
+                SELECT r.id FROM processing_runs r JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=? AND r.process_type='ANALYZE'
+                """, Long.class, completedJobId);
+        assertThat(appJdbc.queryForList("""
+                SELECT artifact_type FROM book_artifacts
+                WHERE processing_run_id=? ORDER BY artifact_type
+                """, String.class, completedRunId)).containsExactly(
+                "BOOK_JSON", "COVER_IMAGE", "MUSIC_INDEX", "SOURCE_PDF");
+        assertThat(appJdbc.queryForObject("""
+                SELECT COUNT(*) FROM book_artifacts
+                WHERE processing_run_id=? AND LENGTH(checksum)=64 AND file_size>0
+                """, Integer.class, completedRunId)).isEqualTo(4);
+        assertThat(json("GET", "/check_status/" + completedJobId, null, access).status())
+                .isEqualTo(HttpStatus.OK.value());
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM book_artifacts WHERE processing_run_id=?",
+                Integer.class, completedRunId)).isEqualTo(4);
+        Files.writeString(defaultsRoot.resolve("music_index.json"),
+                "{\"changed-after-completion\":{}}");
+        assertThat(json("GET", "/check_status/" + completedJobId, null, access).status())
+                .isEqualTo(HttpStatus.OK.value());
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM book_artifacts WHERE processing_run_id=?",
+                Integer.class, completedRunId)).isEqualTo(4);
+        Long musicRunId = appJdbc.queryForObject(
+                "SELECT id FROM processing_runs WHERE queue_job_id=?", Long.class, musicJobId);
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM processing_runs WHERE id=?", String.class, musicRunId))
+                .isEqualTo("QUEUED");
+
+        String musicSignature = "e".repeat(64);
+        Path generatedMusic = defaultsRoot.resolve("music").resolve(musicSignature + ".wav");
+        Files.writeString(generatedMusic, "generated-music");
+        Files.writeString(completedRoot.resolve("completed_full.json"),
+                "{\"book_info\":{\"title\":\"Completed Book\"},"
+                        + "\"chapters\":[{\"segments\":["
+                        + "{\"music_filename\":\"" + musicSignature
+                        + ".wav\",\"music_source\":\"ai_generated\",\"bpm\":88},"
+                        + "{\"music_filename\":\"" + musicSignature
+                        + ".wav\",\"music_source\":\"ai_reused\",\"bpm\":88}]}]}");
+        queueJdbc.update("""
+                INSERT INTO music_prompt_cache(
+                    signature, prompt, genre, bpm, keywords_json,
+                    target_duration_sec, segment_duration_sec, generator_version,
+                    status, filename, relative_path, created_at, updated_at,
+                    generated_at, last_used_at, reuse_count, owner_job_id)
+                VALUES (?, 'calm fantasy instrumental', 'ambient', 88, '["calm","fantasy"]',
+                        120, 30, 'facebook/musicgen-small:v1', 'ready', ?, ?, ?, ?, ?, ?, 1, ?)
+                """, musicSignature, musicSignature + ".wav", musicSignature + ".wav",
+                completedAt, completedAt + 1, completedAt, completedAt + 1, musicJobId);
+        queueJdbc.update("""
+                UPDATE jobs SET status='done', started_at=?, finished_at=?, attempt_count=1
+                WHERE id=?
+                """, completedAt, completedAt + 2, musicJobId);
+        ApiResponse musicDone = json("GET", "/check_status/" + musicJobId, null, access);
+        assertThat(musicDone.status()).as(musicDone.body().toString())
+                .isEqualTo(HttpStatus.OK.value());
+        assertThat(musicDone.body().get("status")).isEqualTo("done");
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM processing_runs WHERE id=?", String.class, musicRunId))
+                .isEqualTo("SUCCEEDED");
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM music_assets WHERE signature=? AND status='READY'",
+                Integer.class, musicSignature)).isEqualTo(1);
+        assertThat(appJdbc.queryForObject(
+                "SELECT reuse_count FROM music_assets WHERE signature=?",
+                Integer.class, musicSignature)).isEqualTo(1);
+        assertThat(appJdbc.queryForList("""
+                SELECT bm.binding_type FROM book_music_bindings bm
+                JOIN music_assets m ON m.id=bm.music_asset_id
+                WHERE m.signature=? ORDER BY bm.segment_key
+                """, String.class, musicSignature)).containsExactly("GENERATED", "CACHE_REUSED");
+        assertThat(appJdbc.queryForList("""
+                SELECT artifact_type FROM book_artifacts
+                WHERE processing_run_id=? ORDER BY artifact_type
+                """, String.class, musicRunId)).containsExactly("BOOK_JSON", "MUSIC_INDEX");
+        assertThat(json("GET", "/check_status/" + musicJobId, null, access).status())
+                .isEqualTo(HttpStatus.OK.value());
+        assertThat(appJdbc.queryForObject(
+                "SELECT COUNT(*) FROM book_music_bindings WHERE processing_run_id=?",
+                Integer.class, musicRunId)).isEqualTo(2);
+
+        ApiResponse processingHistory = json("GET", "/api/books/" + completedFolder
+                + "/processing-history", null, access);
+        assertThat(processingHistory.status()).isEqualTo(HttpStatus.OK.value());
+        assertThat(processingHistory.body().get("book_folder")).isEqualTo(completedFolder);
+        assertThat(processingHistory.body().get("book_status")).isEqualTo("ready");
+        List<?> historyRuns = (List<?>) processingHistory.body().get("runs");
+        assertThat(historyRuns).hasSize(2);
+        List<String> processTypes = historyRuns.stream()
+                .map(item -> String.valueOf(((Map<?, ?>) item).get("process_type"))).toList();
+        assertThat(processTypes).containsExactly("music_generation", "analyze");
+        Map<?, ?> analysisHistory = historyRuns.stream().map(item -> (Map<?, ?>) item)
+                .filter(item -> "analyze".equals(item.get("process_type"))).findFirst().orElseThrow();
+        Map<?, ?> musicHistory = historyRuns.stream().map(item -> (Map<?, ?>) item)
+                .filter(item -> "music_generation".equals(item.get("process_type"))).findFirst().orElseThrow();
+        assertThat((List<?>) analysisHistory.get("artifacts")).hasSize(4);
+        assertThat((List<?>) musicHistory.get("artifacts")).hasSize(2);
+
+        ApiResponse musicTracks = json("GET", "/api/books/" + completedFolder
+                + "/music-tracks", null, access);
+        assertThat(musicTracks.status()).isEqualTo(HttpStatus.OK.value());
+        assertThat(musicTracks.body().get("track_count")).isEqualTo(2);
+        assertThat(musicTracks.body().get("unique_asset_count")).isEqualTo(1);
+        List<?> trackItems = (List<?>) musicTracks.body().get("tracks");
+        List<String> bindingTypes = trackItems.stream()
+                .map(item -> String.valueOf(((Map<?, ?>) item).get("binding_type"))).toList();
+        assertThat(bindingTypes).containsExactly("generated", "cache_reused");
+        Map<?, ?> firstTrack = (Map<?, ?>) trackItems.get(0);
+        assertThat(firstTrack.containsKey("prompt")).isFalse();
+        assertThat(firstTrack.containsKey("storage_key")).isFalse();
+        assertThat(firstTrack.containsKey("generation_params_json")).isFalse();
+        assertThat(json("GET", "/api/books/" + completedFolder
+                + "/processing-history", null, null).status())
+                .isEqualTo(HttpStatus.UNAUTHORIZED.value());
+
+        String otherEmail = "other-flow@example.com";
+        String otherUsername = "other-flow-user";
+        String otherCode = sendCode(otherEmail, "register");
+        assertThat(json("POST", "/register", Map.of(
+                "username", otherUsername, "password", "password123",
+                "email", otherEmail, "code", otherCode), null).status())
+                .isEqualTo(HttpStatus.CREATED.value());
+        String otherAccess = (String) json("POST", "/login", Map.of(
+                "username", otherUsername, "password", "password123"), null)
+                .body().get("access_token");
+        assertThat(json("GET", "/api/books/" + completedFolder
+                + "/processing-history", null, otherAccess).status())
+                .isEqualTo(HttpStatus.NOT_FOUND.value());
+        assertThat(json("GET", "/api/books/" + completedFolder
+                + "/music-tracks", null, otherAccess).status())
+                .isEqualTo(HttpStatus.NOT_FOUND.value());
+
+        ApiResponse missingArtifactAccepted = upload(access);
+        String missingJobId = (String) missingArtifactAccepted.body().get("job_id");
+        long missingFinishedAt = System.currentTimeMillis() / 1000;
+        queueJdbc.update("""
+                UPDATE jobs SET status='done', started_at=?, finished_at=?, attempt_count=1,
+                                output_json='missing_full.json', cover_file='missing.png',
+                                book_title='Broken Book', author='Test Author'
+                WHERE id=?
+                """, missingFinishedAt - 1, missingFinishedAt, missingJobId);
+        assertThat(json("GET", "/check_status/" + missingJobId, null, access).status())
+                .isEqualTo(HttpStatus.CONFLICT.value());
+        assertThat(appJdbc.queryForObject("""
+                SELECT r.status FROM processing_runs r JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=?
+                """, String.class, missingJobId)).isEqualTo("RUNNING");
+        assertThat(appJdbc.queryForObject(
+                "SELECT status FROM books WHERE job_id=?", String.class, missingJobId))
+                .isEqualTo("PROCESSING");
+        ApiResponse availableBooks = json("POST", "/my_books", Map.of(), access);
+        assertThat(availableBooks.status()).isEqualTo(HttpStatus.OK.value());
+        assertThat((List<?>) availableBooks.body().get("books")).isNotEmpty();
+        assertThat(appJdbc.queryForObject("""
+                SELECT COUNT(*) FROM book_artifacts a
+                JOIN processing_runs r ON r.id=a.processing_run_id
+                JOIN books b ON b.id=r.book_id
+                WHERE b.job_id=?
+                """, Integer.class, missingJobId)).isEqualTo(1);
+
         assertMusicAuthorization(access, username, publicId, bookFolder);
 
         ApiResponse changed = json("POST", "/change_password", Map.of(
@@ -175,7 +442,15 @@ class ServiceFlowTest {
         assertThat(json("POST", "/my_books", Map.of(), secondAccess).status())
                 .isEqualTo(HttpStatus.UNAUTHORIZED.value());
         assertThat(ROOT.resolve("storage").resolve("users").resolve(publicId)).doesNotExist();
-        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM usage_events WHERE user_uuid=?",
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM usage_events WHERE user_uuid=?",
+                Integer.class, publicId)).isZero();
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM books WHERE owner_public_id=?",
+                Integer.class, publicId)).isZero();
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM processing_runs", Integer.class)).isZero();
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM book_artifacts", Integer.class)).isZero();
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM book_music_bindings", Integer.class)).isZero();
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM music_assets", Integer.class)).isEqualTo(1);
+        assertThat(queueJdbc.queryForObject("SELECT COUNT(*) FROM jobs WHERE user_uuid=?",
                 Integer.class, publicId)).isZero();
         Path accountTrash = ROOT.resolve("storage").resolve(".trash").resolve("accounts");
         if (Files.exists(accountTrash)) {
@@ -237,7 +512,7 @@ class ServiceFlowTest {
         Map body = json("POST", "/send_code", Map.of("email", email, "purpose", purpose), null).body();
         assertThat(body.get("development_code")).isInstanceOf(String.class);
         String code = (String) body.get("development_code");
-        String stored = jdbc.queryForObject(
+        String stored = appJdbc.queryForObject(
                 "SELECT code FROM verification_codes WHERE email = ? AND purpose = ?",
                 String.class, email, purpose);
         assertThat(stored).isNotEqualTo(code).hasSize(64);

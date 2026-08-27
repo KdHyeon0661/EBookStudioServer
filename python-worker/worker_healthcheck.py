@@ -14,7 +14,9 @@ def main() -> int:
         print("usage: worker_healthcheck.py analyze|music_generation", file=sys.stderr)
         return 2
     role = sys.argv[1]
-    db_path = Path(os.environ.get("EBOOK_DB_PATH", "/data/users.db"))
+    db_path = Path(os.environ.get(
+        "EBOOK_QUEUE_DB_PATH", os.environ.get("EBOOK_DB_PATH", "/data/jobs.db")
+    ))
     maximum_age = int(os.environ.get("WORKER_HEALTH_MAX_AGE_SECONDS", "120"))
     if not db_path.is_file():
         print(f"database does not exist: {db_path}", file=sys.stderr)

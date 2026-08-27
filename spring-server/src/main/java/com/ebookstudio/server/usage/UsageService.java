@@ -2,13 +2,17 @@ package com.ebookstudio.server.usage;
 
 import com.ebookstudio.server.auth.JwtPrincipal;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -37,14 +41,18 @@ public class UsageService {
             int count = 0;
             long createdAt = Instant.now().getEpochSecond();
             for (UsageEventInput event : events) {
-                count += jdbc.update("""
-                        INSERT OR IGNORE INTO usage_events(
-                            user_uuid, event_id, event_type, book_id, occurred_at,
-                            duration_seconds, page_turns, progress_percent, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, principal.publicId(), event.eventId(), event.eventType(),
-                        normalizedBookId(event), event.occurredAt(), event.durationSeconds(),
-                        event.pageTurns(), event.progressPercent(), createdAt);
+                try {
+                    count += jdbc.update("""
+                            INSERT INTO usage_events(
+                                user_uuid, event_id, event_type, book_id, occurred_at,
+                                duration_seconds, page_turns, progress_percent, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, principal.publicId(), event.eventId(), event.eventType(),
+                            normalizedBookId(event), event.occurredAt(), event.durationSeconds(),
+                            event.pageTurns(), event.progressPercent(), createdAt);
+                } catch (DuplicateKeyException duplicateEvent) {
+                    // Offline outbox retries are intentionally idempotent.
+                }
             }
             return count;
         });
@@ -60,7 +68,7 @@ public class UsageService {
                     COALESCE(SUM(CASE WHEN event_type='reading_session' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN event_type='reading_session' THEN page_turns ELSE 0 END), 0),
                     COUNT(DISTINCT CASE WHEN event_type='reading_session' THEN book_id END),
-                    COUNT(DISTINCT date(occurred_at, 'unixepoch')),
+                    COUNT(DISTINCT FLOOR(occurred_at / 86400.0)),
                     COALESCE(SUM(CASE WHEN event_type='app_session' AND occurred_at >= ?
                                       THEN duration_seconds ELSE 0 END), 0),
                     MAX(occurred_at)
@@ -73,6 +81,60 @@ public class UsageService {
                     rs.getLong(1), rs.getLong(2), rs.getLong(3), rs.getLong(4),
                     rs.getLong(5), rs.getLong(6), rs.getLong(7), nullableLastActiveAt);
         }, sevenDaysAgo, principal.publicId());
+    }
+
+    public List<BookUsageSummary> books(JwtPrincipal principal) {
+        return jdbc.query("""
+                SELECT book_id, COALESCE(SUM(duration_seconds), 0), COUNT(*),
+                       COALESCE(SUM(page_turns), 0), MAX(progress_percent), MAX(occurred_at)
+                FROM usage_events
+                WHERE user_uuid=? AND event_type='reading_session' AND book_id IS NOT NULL
+                GROUP BY book_id
+                ORDER BY MAX(occurred_at) DESC, book_id
+                """, (rs, rowNum) -> new BookUsageSummary(
+                rs.getString(1), rs.getLong(2), rs.getLong(3), rs.getLong(4),
+                rs.getInt(5), rs.getLong(6)), principal.publicId());
+    }
+
+    public DailyUsageSeries daily(JwtPrincipal principal, int days) {
+        if (days < 1 || days > 90) {
+            throw new IllegalArgumentException("Days must be between 1 and 90");
+        }
+        long todayEpochDay = Math.floorDiv(Instant.now().getEpochSecond(), 86_400L);
+        long firstEpochDay = todayEpochDay - days + 1;
+        Map<Long, DailyAccumulator> totals = new LinkedHashMap<>();
+        for (long epochDay = firstEpochDay; epochDay <= todayEpochDay; epochDay++) {
+            totals.put(epochDay, new DailyAccumulator());
+        }
+        jdbc.query("""
+                SELECT event_type, occurred_at, duration_seconds, page_turns
+                FROM usage_events
+                WHERE user_uuid=? AND occurred_at>=?
+                ORDER BY occurred_at
+                """, (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
+            DailyAccumulator day = totals.get(Math.floorDiv(rs.getLong("occurred_at"), 86_400L));
+            if (day == null) return;
+            if ("app_session".equals(rs.getString("event_type"))) {
+                day.appSeconds += rs.getLong("duration_seconds");
+            } else if ("reading_session".equals(rs.getString("event_type"))) {
+                day.readingSeconds += rs.getLong("duration_seconds");
+                day.readingSessionCount++;
+                day.pageTurnCount += rs.getLong("page_turns");
+            }
+        }, principal.publicId(), firstEpochDay * 86_400L);
+        List<DailyUsage> daily = totals.entrySet().stream()
+                .map(entry -> new DailyUsage(LocalDate.ofEpochDay(entry.getKey()).toString(),
+                        entry.getValue().appSeconds, entry.getValue().readingSeconds,
+                        entry.getValue().readingSessionCount, entry.getValue().pageTurnCount))
+                .toList();
+        return new DailyUsageSeries(days, "UTC", daily);
+    }
+
+    private static final class DailyAccumulator {
+        private long appSeconds;
+        private long readingSeconds;
+        private long readingSessionCount;
+        private long pageTurnCount;
     }
 
     private void validate(UsageEventInput event) {
@@ -108,6 +170,26 @@ public class UsageService {
         if (event.bookId() == null || event.bookId().isBlank()) return null;
         return event.bookId().trim();
     }
+
+    public record BookUsageSummary(
+            @JsonProperty("book_id") String bookId,
+            @JsonProperty("total_reading_seconds") long totalReadingSeconds,
+            @JsonProperty("reading_session_count") long readingSessionCount,
+            @JsonProperty("page_turn_count") long pageTurnCount,
+            @JsonProperty("highest_progress_percent") int highestProgressPercent,
+            @JsonProperty("last_read_at") long lastReadAt) { }
+
+    public record DailyUsageSeries(
+            @JsonProperty("window_days") int windowDays,
+            @JsonProperty("timezone") String timezone,
+            @JsonProperty("daily") List<DailyUsage> daily) { }
+
+    public record DailyUsage(
+            @JsonProperty("date") String date,
+            @JsonProperty("app_seconds") long appSeconds,
+            @JsonProperty("reading_seconds") long readingSeconds,
+            @JsonProperty("reading_session_count") long readingSessionCount,
+            @JsonProperty("page_turn_count") long pageTurnCount) { }
 
     public record UsageEventInput(
             @JsonProperty("event_id") String eventId,

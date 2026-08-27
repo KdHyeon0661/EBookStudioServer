@@ -3,6 +3,7 @@ package com.ebookstudio.server.auth;
 import com.ebookstudio.server.config.EBookStudioProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -21,14 +22,18 @@ import java.util.stream.Stream;
 public class AccountService {
     private static final Logger log = LoggerFactory.getLogger(AccountService.class);
 
-    private final JdbcTemplate jdbc;
+    private final JdbcTemplate appJdbc;
+    private final JdbcTemplate queueJdbc;
     private final Path usersRoot;
     private final Path trashRoot;
     private final TransactionTemplate transactions;
 
-    public AccountService(JdbcTemplate jdbc, EBookStudioProperties properties,
-                          PlatformTransactionManager transactionManager) {
-        this.jdbc = jdbc;
+    public AccountService(JdbcTemplate appJdbc,
+                          @Qualifier("queueJdbcTemplate") JdbcTemplate queueJdbc,
+                          EBookStudioProperties properties,
+                          @Qualifier("transactionManager") PlatformTransactionManager transactionManager) {
+        this.appJdbc = appJdbc;
+        this.queueJdbc = queueJdbc;
         Path storageRoot = Path.of(properties.storageRoot()).toAbsolutePath().normalize();
         this.usersRoot = storageRoot.resolve("users");
         this.trashRoot = storageRoot.resolve(".trash").resolve("accounts");
@@ -36,20 +41,20 @@ public class AccountService {
     }
 
     public void delete(JwtPrincipal principal) {
-        String email = jdbc.query("SELECT email FROM users WHERE public_id = ?",
+        String email = appJdbc.query("SELECT email FROM users WHERE public_id = ?",
                 rs -> rs.next() ? rs.getString("email") : null, principal.publicId());
         if (email == null) throw new IllegalArgumentException("Account not found");
 
         long now = System.currentTimeMillis() / 1000;
-        jdbc.update("""
+        queueJdbc.update("""
                 UPDATE jobs SET status='cancelled', finished_at=?, cancel_requested_at=?, available_at=NULL
                 WHERE user_uuid=? AND status='queued'
                 """, now, now, principal.publicId());
-        jdbc.update("""
+        queueJdbc.update("""
                 UPDATE jobs SET status='cancel_requested', cancel_requested_at=?
                 WHERE user_uuid=? AND status='running'
                 """, now, principal.publicId());
-        Integer activeJobs = jdbc.queryForObject("""
+        Integer activeJobs = queueJdbc.queryForObject("""
                 SELECT COUNT(*) FROM jobs
                 WHERE user_uuid=? AND status='cancel_requested'
                 """, Integer.class, principal.publicId());
@@ -75,11 +80,12 @@ public class AccountService {
 
         Path finalQuarantined = quarantined;
         try {
+            queueJdbc.update("DELETE FROM jobs WHERE user_uuid = ?", principal.publicId());
             transactions.executeWithoutResult(status -> {
-                jdbc.update("DELETE FROM usage_events WHERE user_uuid = ?", principal.publicId());
-                jdbc.update("DELETE FROM jobs WHERE user_uuid = ?", principal.publicId());
-                jdbc.update("DELETE FROM verification_codes WHERE email = ?", email);
-                jdbc.update("DELETE FROM users WHERE public_id = ?", principal.publicId());
+                appJdbc.update("DELETE FROM usage_events WHERE user_uuid = ?", principal.publicId());
+                appJdbc.update("DELETE FROM books WHERE owner_public_id = ?", principal.publicId());
+                appJdbc.update("DELETE FROM verification_codes WHERE email = ?", email);
+                appJdbc.update("DELETE FROM users WHERE public_id = ?", principal.publicId());
             });
         } catch (RuntimeException databaseError) {
             if (finalQuarantined != null) {
