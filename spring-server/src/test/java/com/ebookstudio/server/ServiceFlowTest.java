@@ -69,6 +69,7 @@ class ServiceFlowTest {
         ApiResponse health = json("GET", "/health", null, null);
         assertThat(health.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(health.body().get("database")).isEqualTo("ok");
+        assertThat(health.body().get("email")).isEqualTo("development-code");
         assertThat(queueJdbc.queryForObject(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='music_prompt_cache'",
                 Integer.class)).isEqualTo(1);
@@ -120,7 +121,7 @@ class ServiceFlowTest {
         ApiResponse dailyUsage = json("GET", "/usage/daily?days=7", null, access);
         assertThat(dailyUsage.status()).isEqualTo(HttpStatus.OK.value());
         assertThat(dailyUsage.body().get("window_days")).isEqualTo(7);
-        assertThat(dailyUsage.body().get("timezone")).isEqualTo("UTC");
+        assertThat(dailyUsage.body().get("timezone")).isEqualTo("Asia/Seoul");
         List<?> dailyItems = (List<?>) dailyUsage.body().get("daily");
         assertThat(dailyItems).hasSize(7).anySatisfy(item ->
                 assertThat(((Map<?, ?>) item).get("reading_seconds")).isEqualTo(120));
@@ -437,6 +438,35 @@ class ServiceFlowTest {
         Map secondLogin = json("POST", "/login", Map.of(
                 "username", username, "password", "recovered789"), null).body();
         String secondAccess = (String) secondLogin.get("access_token");
+
+        String queuedBeforeDeleteId = java.util.UUID.randomUUID().toString();
+        String runningBeforeDeleteId = java.util.UUID.randomUUID().toString();
+        long deletionAttemptAt = System.currentTimeMillis() / 1000;
+        queueJdbc.update("""
+                INSERT INTO jobs(id, type, user_uuid, status, created_at)
+                VALUES (?, 'analyze', ?, 'queued', ?)
+                """, queuedBeforeDeleteId, publicId, deletionAttemptAt);
+        queueJdbc.update("""
+                INSERT INTO jobs(id, type, user_uuid, status, created_at, started_at,
+                                 heartbeat_at, worker_id)
+                VALUES (?, 'analyze', ?, 'running', ?, ?, ?, 'deletion-test-worker')
+                """, runningBeforeDeleteId, publicId, deletionAttemptAt,
+                deletionAttemptAt, deletionAttemptAt);
+
+        ApiResponse delayedDeletion = json("DELETE", "/account", null, secondAccess);
+        assertThat(delayedDeletion.status()).isEqualTo(HttpStatus.CONFLICT.value());
+        assertThat(queueJdbc.queryForObject("SELECT status FROM jobs WHERE id=?", String.class,
+                queuedBeforeDeleteId)).isEqualTo("queued");
+        assertThat(queueJdbc.queryForObject("SELECT status FROM jobs WHERE id=?", String.class,
+                runningBeforeDeleteId)).isEqualTo("cancel_requested");
+        assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM users WHERE public_id=?",
+                Integer.class, publicId)).isEqualTo(1);
+        assertThat(ROOT.resolve("storage").resolve("users").resolve(publicId)).exists();
+
+        queueJdbc.update("""
+                UPDATE jobs SET status='cancelled', finished_at=?, worker_id=NULL, heartbeat_at=NULL
+                WHERE id=?
+                """, deletionAttemptAt + 1, runningBeforeDeleteId);
         assertThat(json("DELETE", "/account", null, secondAccess).status())
                 .isEqualTo(HttpStatus.OK.value());
         assertThat(json("POST", "/my_books", Map.of(), secondAccess).status())
@@ -451,6 +481,9 @@ class ServiceFlowTest {
         assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM book_music_bindings", Integer.class)).isZero();
         assertThat(appJdbc.queryForObject("SELECT COUNT(*) FROM music_assets", Integer.class)).isEqualTo(1);
         assertThat(queueJdbc.queryForObject("SELECT COUNT(*) FROM jobs WHERE user_uuid=?",
+                Integer.class, publicId)).isZero();
+        assertThat(queueJdbc.queryForObject(
+                "SELECT COUNT(*) FROM account_cleanup_tasks WHERE user_uuid=?",
                 Integer.class, publicId)).isZero();
         Path accountTrash = ROOT.resolve("storage").resolve(".trash").resolve("accounts");
         if (Files.exists(accountTrash)) {

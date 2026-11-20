@@ -26,6 +26,7 @@ public class AuthService {
     private final JwtService jwtService;
     private final EBookStudioProperties properties;
     private final VerificationMailService mailService;
+    private final boolean postgresql;
 
     public AuthService(JdbcTemplate jdbc, PasswordEncoder passwordEncoder, JwtService jwtService,
                        EBookStudioProperties properties, VerificationMailService mailService) {
@@ -34,6 +35,10 @@ public class AuthService {
         this.jwtService = jwtService;
         this.properties = properties;
         this.mailService = mailService;
+        this.postgresql = Boolean.TRUE.equals(jdbc.execute(
+                (org.springframework.jdbc.core.ConnectionCallback<Boolean>) connection ->
+                        "PostgreSQL".equalsIgnoreCase(
+                                connection.getMetaData().getDatabaseProductName())));
     }
 
     @Transactional
@@ -41,7 +46,7 @@ public class AuthService {
         String email = normalizeEmail(rawEmail);
         String purpose = normalizePurpose(rawPurpose);
         if (!properties.emailDeliveryEnabled() && !properties.emailExposeDevelopmentCode()) {
-            throw new IllegalStateException("Email delivery is not configured");
+            throw new IllegalStateException("인증 메일 서비스가 설정되지 않았습니다");
         }
         boolean exists = emailExists(email);
         if ("register".equals(purpose) && exists) {
@@ -62,6 +67,36 @@ public class AuthService {
         String code = String.valueOf(100000 + RANDOM.nextInt(900000));
         long expiresAt = now + properties.verificationCodeSeconds();
         String codeHash = hashVerificationCode(email, purpose, code);
+        storeVerificationCode(email, codeHash, expiresAt, purpose, now,
+                now - properties.verificationSendCooldownSeconds());
+        mailService.send(email, code, purpose);
+        String developmentCode = properties.emailExposeDevelopmentCode() && !properties.emailDeliveryEnabled()
+                ? code : null;
+        return new CodeDelivery(properties.emailDeliveryEnabled(), developmentCode);
+    }
+
+    private void storeVerificationCode(String email, String codeHash, long expiresAt,
+                                       String purpose, long now, long cooldownCutoff) {
+        if (postgresql) {
+            int stored = jdbc.update("""
+                    INSERT INTO verification_codes(
+                        email, code, expires_at, purpose, last_sent_at, failed_attempts)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                    ON CONFLICT (email) DO UPDATE SET
+                        code=EXCLUDED.code,
+                        expires_at=EXCLUDED.expires_at,
+                        purpose=EXCLUDED.purpose,
+                        last_sent_at=EXCLUDED.last_sent_at,
+                        failed_attempts=0
+                    WHERE verification_codes.purpose <> EXCLUDED.purpose
+                       OR verification_codes.last_sent_at <= ?
+                    """, email, codeHash, expiresAt, purpose, now, cooldownCutoff);
+            if (stored == 0) {
+                throw new IllegalStateException("Please wait before requesting another code");
+            }
+            return;
+        }
+
         int updated = jdbc.update("""
                 UPDATE verification_codes
                 SET code=?, expires_at=?, purpose=?, last_sent_at=?, failed_attempts=0
@@ -82,10 +117,6 @@ public class AuthService {
                         """, codeHash, expiresAt, purpose, now, email);
             }
         }
-        mailService.send(email, code, purpose);
-        String developmentCode = properties.emailExposeDevelopmentCode() && !properties.emailDeliveryEnabled()
-                ? code : null;
-        return new CodeDelivery(properties.emailDeliveryEnabled(), developmentCode);
     }
 
     @Transactional
@@ -93,7 +124,7 @@ public class AuthService {
         String email = normalizeEmail(rawEmail);
         String purpose = normalizePurpose(rawPurpose);
         if (!properties.emailDeliveryEnabled() && !properties.emailExposeDevelopmentCode()) {
-            throw new IllegalStateException("Email delivery is not configured");
+            throw new IllegalStateException("인증 메일 서비스가 설정되지 않았습니다");
         }
         List<CodeRow> rows = jdbc.query("""
                 SELECT code, expires_at, failed_attempts FROM verification_codes

@@ -7,6 +7,7 @@ from defaults.genre_bpm_connector import pick_bpm, get_bpm_range
 for dependency in ("torch", "transformers", "scipy", "numpy", "nltk"):
     pytest.importorskip(dependency, reason="full music worker dependencies are not installed")
 
+import background_music_jobs as music_jobs
 from background_music_jobs import create_dynamic_music_prompt, estimate_bpm_from_analysis
 
 
@@ -61,3 +62,36 @@ def test_create_dynamic_music_prompt():
         assert bpm == 110
         assert "Mood:" in prompt
         assert "Genre: pop" in prompt
+
+
+def test_generated_music_is_trimmed_to_requested_duration(monkeypatch):
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeProcessor:
+        def __call__(self, **_kwargs):
+            return FakeInputs()
+
+    class FakeModel:
+        class Config:
+            class AudioEncoder:
+                sampling_rate = 10
+
+            audio_encoder = AudioEncoder()
+
+        config = Config()
+
+        def generate(self, **_kwargs):
+            return music_jobs.torch.ones((1, 1, 50))
+
+    monkeypatch.setattr(music_jobs, "processor", FakeProcessor())
+    monkeypatch.setattr(music_jobs, "music_model", FakeModel())
+    monkeypatch.setattr(music_jobs.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(music_jobs.torch.cuda, "is_available", lambda: False)
+
+    audio, sample_rate = music_jobs.generate_music_segments(
+        "calm instrumental", target_duration_sec=4, segment_duration=5)
+
+    assert sample_rate == 10
+    assert len(audio) == 40

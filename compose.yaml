@@ -75,7 +75,8 @@ services:
       ACCESS_TOKEN_SECONDS: ${ACCESS_TOKEN_SECONDS:-3600}
       REFRESH_TOKEN_SECONDS: ${REFRESH_TOKEN_SECONDS:-604800}
       EMAIL_DELIVERY_ENABLED: ${EMAIL_DELIVERY_ENABLED:-false}
-      EMAIL_EXPOSE_DEVELOPMENT_CODE: ${EMAIL_EXPOSE_DEVELOPMENT_CODE:-false}
+      # Local Compose is loopback-only and exposes the code when SMTP is not configured.
+      EMAIL_EXPOSE_DEVELOPMENT_CODE: ${EMAIL_EXPOSE_DEVELOPMENT_CODE:-true}
       EMAIL_FROM: ${EMAIL_FROM:-noreply@ebookstudio.local}
       SMTP_HOST: ${SMTP_HOST:-localhost}
       SMTP_PORT: ${SMTP_PORT:-587}
@@ -84,7 +85,7 @@ services:
       SMTP_AUTH: ${SMTP_AUTH:-true}
       SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
     ports:
-      - "${API_PORT:-5000}:5000"
+      - "127.0.0.1:${API_PORT:-5000}:5000"
     volumes:
       - app-data:/data
     depends_on:

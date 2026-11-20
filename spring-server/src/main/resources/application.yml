@@ -40,6 +40,7 @@ ebookstudio:
   verification-ip-limit: ${VERIFICATION_IP_LIMIT:20}
   verification-email-limit: ${VERIFICATION_EMAIL_LIMIT:5}
   verification-rate-window-seconds: ${VERIFICATION_RATE_WINDOW_SECONDS:3600}
+  usage-timezone: ${USAGE_TIMEZONE:Asia/Seoul}
   email-from: ${EMAIL_FROM:noreply@ebookstudio.local}
   email-delivery-enabled: ${EMAIL_DELIVERY_ENABLED:false}
   email-expose-development-code: ${EMAIL_EXPOSE_DEVELOPMENT_CODE:false}

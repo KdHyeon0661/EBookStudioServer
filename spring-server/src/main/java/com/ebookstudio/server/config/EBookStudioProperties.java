@@ -16,6 +16,7 @@ public record EBookStudioProperties(
         int verificationIpLimit,
         int verificationEmailLimit,
         long verificationRateWindowSeconds,
+        String usageTimezone,
         String emailFrom,
         boolean emailDeliveryEnabled,
         boolean emailExposeDevelopmentCode

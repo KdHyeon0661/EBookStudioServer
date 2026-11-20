@@ -1,6 +1,7 @@
 package com.ebookstudio.server.usage;
 
 import com.ebookstudio.server.auth.JwtPrincipal;
+import com.ebookstudio.server.config.EBookStudioProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -10,7 +11,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -26,10 +29,22 @@ public class UsageService {
 
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transactions;
+    private final boolean postgresql;
+    private final ZoneId usageZone;
 
-    public UsageService(JdbcTemplate jdbc, PlatformTransactionManager transactionManager) {
+    public UsageService(JdbcTemplate jdbc, PlatformTransactionManager transactionManager,
+                        EBookStudioProperties properties) {
         this.jdbc = jdbc;
         this.transactions = new TransactionTemplate(transactionManager);
+        this.postgresql = Boolean.TRUE.equals(jdbc.execute(
+                (org.springframework.jdbc.core.ConnectionCallback<Boolean>) connection ->
+                        "PostgreSQL".equalsIgnoreCase(
+                                connection.getMetaData().getDatabaseProductName())));
+        try {
+            this.usageZone = ZoneId.of(properties.usageTimezone());
+        } catch (RuntimeException error) {
+            throw new IllegalStateException("Invalid ebookstudio.usage-timezone", error);
+        }
     }
 
     public BatchResult ingest(JwtPrincipal principal, List<UsageEventInput> events) {
@@ -41,46 +56,63 @@ public class UsageService {
             int count = 0;
             long createdAt = Instant.now().getEpochSecond();
             for (UsageEventInput event : events) {
-                try {
-                    count += jdbc.update("""
-                            INSERT INTO usage_events(
-                                user_uuid, event_id, event_type, book_id, occurred_at,
-                                duration_seconds, page_turns, progress_percent, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, principal.publicId(), event.eventId(), event.eventType(),
-                            normalizedBookId(event), event.occurredAt(), event.durationSeconds(),
-                            event.pageTurns(), event.progressPercent(), createdAt);
-                } catch (DuplicateKeyException duplicateEvent) {
-                    // Offline outbox retries are intentionally idempotent.
-                }
+                count += insertUsageEvent(principal, event, createdAt);
             }
             return count;
         });
         return new BatchResult(events.size(), inserted == null ? 0 : inserted);
     }
 
+    private int insertUsageEvent(JwtPrincipal principal, UsageEventInput event, long createdAt) {
+        String conflictClause = postgresql
+                ? " ON CONFLICT (user_uuid, event_id) DO NOTHING" : "";
+        try {
+            return jdbc.update("""
+                    INSERT INTO usage_events(
+                        user_uuid, event_id, event_type, book_id, occurred_at,
+                        duration_seconds, page_turns, progress_percent, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """ + conflictClause, principal.publicId(), event.eventId(), event.eventType(),
+                    normalizedBookId(event), event.occurredAt(), event.durationSeconds(),
+                    event.pageTurns(), event.progressPercent(), createdAt);
+        } catch (DuplicateKeyException duplicateEvent) {
+            // H2 does not support PostgreSQL's conflict clause. Its failed statement does not
+            // poison the surrounding transaction, so the compatibility path remains idempotent.
+            if (postgresql) throw duplicateEvent;
+            return 0;
+        }
+    }
+
     public UsageSummary summary(JwtPrincipal principal) {
         long sevenDaysAgo = Instant.now().minusSeconds(7L * 24 * 60 * 60).getEpochSecond();
-        return jdbc.query("""
+        UsageSummary totals = jdbc.query("""
                 SELECT
                     COALESCE(SUM(CASE WHEN event_type='app_session' THEN duration_seconds ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN event_type='reading_session' THEN duration_seconds ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN event_type='reading_session' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN event_type='reading_session' THEN page_turns ELSE 0 END), 0),
                     COUNT(DISTINCT CASE WHEN event_type='reading_session' THEN book_id END),
-                    COUNT(DISTINCT FLOOR(occurred_at / 86400.0)),
                     COALESCE(SUM(CASE WHEN event_type='app_session' AND occurred_at >= ?
                                       THEN duration_seconds ELSE 0 END), 0),
                     MAX(occurred_at)
                 FROM usage_events WHERE user_uuid=?
                 """, rs -> {
             rs.next();
-            long lastActiveAt = rs.getLong(8);
+            long lastActiveAt = rs.getLong(7);
             Long nullableLastActiveAt = rs.wasNull() ? null : lastActiveAt;
             return new UsageSummary(
                     rs.getLong(1), rs.getLong(2), rs.getLong(3), rs.getLong(4),
-                    rs.getLong(5), rs.getLong(6), rs.getLong(7), nullableLastActiveAt);
+                    rs.getLong(5), 0, rs.getLong(6), nullableLastActiveAt);
         }, sevenDaysAgo, principal.publicId());
+
+        Set<LocalDate> activeDates = new HashSet<>();
+        jdbc.query("SELECT occurred_at FROM usage_events WHERE user_uuid=?",
+                (org.springframework.jdbc.core.RowCallbackHandler) rs -> activeDates.add(
+                        Instant.ofEpochSecond(rs.getLong(1)).atZone(usageZone).toLocalDate()),
+                principal.publicId());
+        return new UsageSummary(totals.totalAppSeconds(), totals.totalReadingSeconds(),
+                totals.readingSessionCount(), totals.pageTurnCount(), totals.booksReadCount(),
+                activeDates.size(), totals.last7DaysAppSeconds(), totals.lastActiveAt());
     }
 
     public List<BookUsageSummary> books(JwtPrincipal principal) {
@@ -100,8 +132,11 @@ public class UsageService {
         if (days < 1 || days > 90) {
             throw new IllegalArgumentException("Days must be between 1 and 90");
         }
-        long todayEpochDay = Math.floorDiv(Instant.now().getEpochSecond(), 86_400L);
+        LocalDate today = LocalDate.now(usageZone);
+        long todayEpochDay = today.toEpochDay();
         long firstEpochDay = todayEpochDay - days + 1;
+        long firstEpochSecond = LocalDate.ofEpochDay(firstEpochDay)
+                .atStartOfDay(usageZone).toEpochSecond();
         Map<Long, DailyAccumulator> totals = new LinkedHashMap<>();
         for (long epochDay = firstEpochDay; epochDay <= todayEpochDay; epochDay++) {
             totals.put(epochDay, new DailyAccumulator());
@@ -112,7 +147,9 @@ public class UsageService {
                 WHERE user_uuid=? AND occurred_at>=?
                 ORDER BY occurred_at
                 """, (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
-            DailyAccumulator day = totals.get(Math.floorDiv(rs.getLong("occurred_at"), 86_400L));
+            long epochDay = Instant.ofEpochSecond(rs.getLong("occurred_at"))
+                    .atZone(usageZone).toLocalDate().toEpochDay();
+            DailyAccumulator day = totals.get(epochDay);
             if (day == null) return;
             if ("app_session".equals(rs.getString("event_type"))) {
                 day.appSeconds += rs.getLong("duration_seconds");
@@ -121,13 +158,13 @@ public class UsageService {
                 day.readingSessionCount++;
                 day.pageTurnCount += rs.getLong("page_turns");
             }
-        }, principal.publicId(), firstEpochDay * 86_400L);
+        }, principal.publicId(), firstEpochSecond);
         List<DailyUsage> daily = totals.entrySet().stream()
                 .map(entry -> new DailyUsage(LocalDate.ofEpochDay(entry.getKey()).toString(),
                         entry.getValue().appSeconds, entry.getValue().readingSeconds,
                         entry.getValue().readingSessionCount, entry.getValue().pageTurnCount))
                 .toList();
-        return new DailyUsageSeries(days, "UTC", daily);
+        return new DailyUsageSeries(days, usageZone.getId(), daily);
     }
 
     private static final class DailyAccumulator {

@@ -82,6 +82,12 @@ public class DatabaseInitializer {
                     cancel_requested_at INTEGER
                 )
                 """);
+        queueJdbc.execute("""
+                CREATE TABLE IF NOT EXISTS account_cleanup_tasks (
+                    user_uuid TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL
+                )
+                """);
 
         addMissingColumn("jobs", "output_json", "TEXT");
         addMissingColumn("jobs", "cover_file", "TEXT");

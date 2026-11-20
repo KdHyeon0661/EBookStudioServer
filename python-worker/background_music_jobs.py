@@ -314,7 +314,7 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
             else:
                 try:
                     final_audio = crossfade_audio(final_audio, chunk_audio, overlap_sec, sampling_rate)
-                except:
+                except Exception:
                     final_audio = np.concatenate([final_audio, chunk_audio])
 
             del inputs, audio_values
@@ -331,6 +331,15 @@ def generate_music_segments(prompt, target_duration_sec=120, segment_duration=30
             continue
 
     if final_audio is not None and len(final_audio) > 0:
+        target_samples = int(target_duration_sec * sampling_rate)
+        if len(final_audio) < target_samples:
+            raise RuntimeError(
+                f"MusicGen produced only {len(final_audio) / sampling_rate:.1f}s "
+                f"of the requested {target_duration_sec}s"
+            )
+        # Chunk-count rounding intentionally over-generates. Trim after all crossfades so
+        # the WAV duration and the catalog's target_duration_sec always agree exactly.
+        final_audio = final_audio[:target_samples]
         max_val = np.max(np.abs(final_audio))
         if max_val > 0: final_audio = final_audio / max_val * 0.9
         return final_audio, sampling_rate
@@ -431,12 +440,16 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                                 raise RuntimeError("Timed out waiting for identical prompt generation")
                     try:
                         master_path = catalog.find_ready(signature)
+                        catalog_hit = master_path is not None
                         if master_path is None:
                             master_path = find_master_file(filename, root_folder)
                         if master_path is not None:
-                            catalog.mark_ready(
-                                signature, metadata, filename, master_path, job_id, reused=True
-                            )
+                            # find_ready already records one reuse. Only register a reuse
+                            # here when the file was discovered outside the catalog.
+                            if not catalog_hit:
+                                catalog.mark_ready(
+                                    signature, metadata, filename, master_path, job_id, reused=True
+                                )
                             reused += 1
                         else:
                             catalog.mark_generating(signature, metadata, filename, job_id)
@@ -461,6 +474,8 @@ def process_book_background(json_path, music_folder, web_path_prefix, username=N
                                         "generator_version": DEFAULT_GENERATOR_VERSION,
                                         "prompt": prompt, "emotion": target_emotion,
                                         "genre": genre, "bpm": bpm, "keywords": keywords,
+                                        "target_duration_sec": target_duration,
+                                        "actual_duration_sec": len(audio) / sample_rate,
                                         "created_at": time.time(),
                                     }, output, ensure_ascii=False, indent=2)
                                 os.replace(metadata_path + ".tmp", metadata_path)
